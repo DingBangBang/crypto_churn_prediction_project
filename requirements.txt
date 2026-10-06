@@ -1,0 +1,14 @@
+requests>=2.32
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.4
+hdbscan>=0.8.40
+lightgbm>=4.3
+xgboost>=2.0
+shap>=0.45
+plotly>=5.22
+streamlit>=1.36
+python-dotenv>=1.0
+statsmodels>=0.14
+kaleido
+pytest>=8.0

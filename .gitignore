@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Environment secrets
+.env
+environment.env
+environment.env.example.bak
+
+# Secret API-key scratch files (must NOT be committed)
+Etherscan_api.txt
+deepseek_api.txt
+Github_Repo_SSH.txt
+
+# Runtime data (SQLite databases + WAL side files)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/.bootstrap_*
+
+# Generated reports / figures
+reports/*.html
+reports/*.png
+reports/*.json
+!reports/.gitkeep
+
+# OS / IDE
+.DS_Store
+.vscode/
+
+# Generated demo artifacts
+/*.png

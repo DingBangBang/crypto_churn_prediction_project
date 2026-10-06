@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.git/
+.pytest_cache/
+data/*.db
+data/*.db-*
+reports/
+environment.env
+.env
+Etherscan_api.txt
+*.md
+.vscode/

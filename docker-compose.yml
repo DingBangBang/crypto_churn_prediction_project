@@ -1,0 +1,41 @@
+# 加密货币用户行为聚类分析与流失预测 — 一键堆栈
+#
+# `docker compose up -d --build` 会：构建镜像 -> 首次启动自动跑完整流水线
+# (data_fetcher -> feature_engineer -> cluster_analyzer -> churn_model) -> 启动
+# Streamlit 看板 (http://localhost:8501)。之后重启会直接启动看板（用 marker 判断）。
+#
+# 想“跑完自动打开浏览器”，用根目录的 ./start.sh（它会 up 之后等待并 open 页面）。
+services:
+  churn-app:
+    build: .
+    image: bonnie333333333/crypto-churn-prediction:latest
+    container_name: crypto-churn-app
+    restart: unless-stopped
+    # environment.env 可选：放 ETHERSCAN_API_KEY / ADDRESS_LIMIT / 邮件与 Lark 配置。
+    # 没有任何 env 文件时仍可启动（只会展示已有 DB 数据）。
+    env_file:
+      - path: "environment.env"
+        required: false
+      - path: ".env"
+        required: false
+    environment:
+      # 首启抓取多少地址：200 = 快速演示；改为 2000 = 全量。
+      ADDRESS_LIMIT: "${ADDRESS_LIMIT:-200}"
+      CHAIN_ID: "${CHAIN_ID:-1}"
+      CHURN_DB_PATH: "/app/data/crypto_churn.db"
+      DASHBOARD_URL: "http://localhost:8501"
+      # 设为 1 可强制下次启动重跑整个流水线。
+      FORCE_PIPELINE: "${FORCE_PIPELINE:-0}"
+    ports:
+      - "8501:8501"
+    volumes:
+      # SQLite 数据库（宿主可读，方便备份/迁移）与生成的报告。
+      - ./data:/app/data:rw
+      - ./reports:/app/reports:rw
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; \
+sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>加密用户流失预警</title>
+</head>
+<body style="margin:0;padding:0;background:#f4f6fb;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1f2937;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f4f6fb;padding:24px 0;">
+    <tr><td align="center">
+      <table role="presentation" width="640" cellspacing="0" cellpadding="0" style="background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 6px 24px rgba(15,23,42,.08);">
+        <!-- Header -->
+        <tr>
+          <td style="background:linear-gradient(135deg,#4f46e5,#0ea5e9);padding:26px 32px;">
+            <div style="font-size:13px;letter-spacing:2px;color:#e0e7ff;text-transform:uppercase;">Crypto Behaviour Intelligence</div>
+            <div style="font-size:24px;font-weight:700;color:#ffffff;margin-top:6px;">⚠️ 用户流失预警 · {{alert_level}}</div>
+            <div style="font-size:13px;color:#e0e7ff;margin-top:8px;">生成时间：{{generated_at}}</div>
+          </td>
+        </tr>
+        <!-- Summary cards -->
+        <tr><td style="padding:26px 32px 6px;">
+          <div style="font-size:16px;font-weight:700;margin-bottom:14px;">核心风险指标</div>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+            <tr>
+              <td style="padding:6px;" width="33%">
+                <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:14px;text-align:center;">
+                  <div style="font-size:12px;color:#b91c1c;">预测流失率(30天)</div>
+                  <div style="font-size:26px;font-weight:800;color:#dc2626;">{{churn_rate}}</div>
+                  <div style="font-size:11px;color:#b91c1c;">阈值 {{churn_rate_threshold}}</div>
+                </div>
+              </td>
+              <td style="padding:6px;" width="33%">
+                <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:14px;text-align:center;">
+                  <div style="font-size:12px;color:#c2410c;">高危地址占比</div>
+                  <div style="font-size:26px;font-weight:800;color:#ea580c;">{{high_risk_ratio}}</div>
+                  <div style="font-size:11px;color:#c2410c;">阈值 {{risk_ratio_threshold}}</div>
+                </div>
+              </td>
+              <td style="padding:6px;" width="33%">
+                <div style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:10px;padding:14px;text-align:center;">
+                  <div style="font-size:12px;color:#4338ca;">人均频次降低</div>
+                  <div style="font-size:26px;font-weight:800;color:#4f46e5;">{{freq_drop}}</div>
+                  <div style="font-size:11px;color:#4338ca;">次/天</div>
+                </div>
+              </td>
+            </tr>
+          </table>
+        </td></tr>
+        <!-- Details -->
+        <tr><td style="padding:18px 32px 6px;">
+          <div style="font-size:16px;font-weight:700;margin-bottom:10px;">触发原因</div>
+          <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:14px;font-size:14px;line-height:1.7;">
+            {{trigger_reasons}}
+          </div>
+        </td></tr>
+        <!-- Table -->
+        <tr><td style="padding:18px 32px 6px;">
+          <div style="font-size:16px;font-weight:700;margin-bottom:10px;">风险概览</div>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:14px;border-collapse:collapse;">
+            <tr style="background:#f3f4f6;">
+              <td style="padding:8px 12px;border:1px solid #e5e7eb;">指标</td>
+              <td style="padding:8px 12px;border:1px solid #e5e7eb;text-align:right;">当前值</td>
+            </tr>
+            {{detail_rows}}
+          </table>
+        </td></tr>
+        <!-- CTA -->
+        <tr><td style="padding:22px 32px 8px;" align="center">
+          <a href="{{dashboard_url}}" style="display:inline-block;background:#4f46e5;color:#ffffff;text-decoration:none;font-weight:600;padding:12px 28px;border-radius:10px;">打开实时看板 →</a>
+        </td></tr>
+        <!-- Footer -->
+        <tr><td style="padding:14px 32px 28px;color:#9ca3af;font-size:12px;line-height:1.6;">
+          本邮件由「加密货币用户行为聚类分析与流失预测」系统自动发出。<br>
+          聚类标签：高频大户 / 长期持有者 / DeFi农民 / 高频套利者 / 噪音地址。<br>
+          如需调整阈值，请修改 <code>environment.env</code> 中的 ALERT_* 变量。
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
