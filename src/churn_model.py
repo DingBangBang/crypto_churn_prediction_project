@@ -198,17 +198,25 @@ def _address_daily_series(conn, ref_day: int, horizon_pad: int = 0) -> Dict[str,
 
 
 def _forecast_one(series: np.ndarray, horizon: int) -> np.ndarray:
-    """Forecast the next ``horizon`` daily counts; fall back to a naive baseline."""
+    """Forecast the next ``horizon`` daily counts; fall back to a naive baseline.
+
+    Raw transaction counts are hugely spiky (exchange addresses peak at thousands
+    of tx/day), which makes a plain ARIMA(1,1,1) explode. We fit on ``log1p(series)``
+    — a variance-stabilising transform — then invert with ``expm1`` and cap the
+    result at the address's own historical peak, which keeps the projection physical.
+    """
     recent_mean = float(series[-14:].mean()) if len(series) >= 14 else float(series.mean())
     if len(series) < 10 or series.sum() == 0:
         return np.full(horizon, max(recent_mean, 0.0))
     try:
         from statsmodels.tsa.arima.model import ARIMA
 
-        model = ARIMA(series, order=(1, 1, 1), trend="n")
+        y = np.log1p(series)
+        model = ARIMA(y, order=(1, 1, 1), trend="n")
         res = model.fit()
-        fc = np.asarray(res.forecast(steps=horizon), dtype=float)
-        return np.clip(fc, 0, None)
+        fc = np.expm1(np.asarray(res.forecast(steps=horizon), dtype=float))
+        cap = max(float(series.max()), recent_mean * 3.0, 1.0)
+        return np.clip(fc, 0, cap)
     except Exception:
         return np.full(horizon, max(recent_mean, 0.0))
 

@@ -4,9 +4,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# LightGBM/XGBoost need libgomp at runtime; keep the image slim otherwise.
+# Build + runtime deps:
+#  * libgomp1  -> LightGBM/XGBoost runtime
+#  * gcc/g++/python3-dev/cython -> compile hdbscan from source (no aarch64 wheel)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 \
+    && apt-get install -y --no-install-recommends \
+        libgomp1 gcc g++ python3-dev cython3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Dependencies first for better layer caching.

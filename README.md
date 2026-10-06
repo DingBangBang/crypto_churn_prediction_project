@@ -255,6 +255,11 @@ docker push bonnie333333333/crypto-churn-prediction:latest
 `environment.env`（可选，未提供也能启动）；挂载 `./data` 与 `./reports` 持久化；
 `healthcheck` 探测 `/_stcore/health`。
 
+> **构建小贴士（Apple Silicon / linux-arm64）**：镜像基于 `python:3.11-slim`，
+> 由于 arm64 上没有 `hdbscan` 预编译 wheel，Dockerfile 里预装了 `gcc g++ python3-dev cython3`
+> 用于源码编译；`xgboost` 固定为 `2.1.4`（`3.x` 会在 Linux 上拉取数百 MB 的 CUDA 依赖，
+> 即使只用 CPU，会让镜像膨胀）。首次 `docker build` 约需几分钟。
+
 ---
 
 ## ✨ 未来可优化点

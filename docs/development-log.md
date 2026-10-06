@@ -90,12 +90,18 @@
 ### 踩坑
 1. **ARIMA 拟合慢/易失败**：2000 地址逐个拟合代价高。解决：序列 <10 或全零时直接用
    近 14 天均值"朴素预测"；`try/except` 包裹，个别失败不影响整体。
-2. **单类标签**：若测试集全是一种标签，`roc_auc_score` 会报错。解决：捕获 `ValueError`
+2. **ARIMA 外推爆炸**：交易笔数序列极度稀疏+尖峰（交易所地址日峰值上千），直接对原始
+   计数拟合 `ARIMA(1,1,1)` 会**指数级外推**（实测人均频次被预测到 242、第 30 天 401）。
+   解决：先对 `log1p(series)` 做**方差稳定变换**再拟合，`expm1` 反变换，并把预测**截断到
+   该地址历史峰值**。修复后人均 34 → 预测 19（合理下降）。
+3. **单类标签**：若测试集全是一种标签，`roc_auc_score` 会报错。解决：捕获 `ValueError`
    返回 `nan`；样本过少或标签单一直接跳过训练。
-3. **SHAP 版本差异**：新版 `shap_values` 对二分类可能返回 3 维
+4. **SHAP 版本差异**：新版 `shap_values` 对二分类可能返回 3 维
    `(n, features, classes)`，需要取 `[:, :, 1]`。
-4. **重打分要用预测频次**：把 `tx_freq_daily/weekly/monthly` 替换为 ARIMA 预测值后
+5. **重打分要用预测频次**：把 `tx_freq_daily/weekly/monthly` 替换为 ARIMA 预测值后
    再喂给分类器，才能得到"未来流失概率"，而不是复述当前状态。
+6. **arm64 Docker 编译 hdbscan**：`python:3.11-slim` 在 Apple Silicon（linux/arm64）上
+   没有 hdbscan 预编译 wheel，会回退到源码编译，需在镜像里装 `gcc g++ python3-dev cython3`。
 
 ## 6. 可视化与告警
 

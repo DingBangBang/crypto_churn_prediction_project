@@ -4,7 +4,9 @@ numpy>=1.26
 scikit-learn>=1.4
 hdbscan>=0.8.40
 lightgbm>=4.3
-xgboost>=2.0
+# Pinned to 2.1.4: 3.x pulls huge nvidia-nccl CUDA wheels on all Linux (GBs) even for
+# CPU-only use; 2.1.4 is numpy-2 compatible and excludes that dep on arm64.
+xgboost==2.1.4
 shap>=0.45
 plotly>=5.22
 streamlit>=1.36

@@ -112,7 +112,7 @@ with col2:
         cnt.columns = ["label", "count"]
         fig = px.pie(cnt, names="label", values="count", hole=0.4,
                      color_discrete_sequence=px.colors.qualitative.Set3)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("暂无聚类结果，请先运行 cluster_analyzer.py")
 
@@ -130,7 +130,7 @@ with col3:
                                           theta=rf + [rf[0]], fill="toself", name=str(label)))
         fig.update_layout(height=420, polar=dict(radialaxis=dict(range=[0, 1])),
                           margin=dict(t=30, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("暂无数据")
 
@@ -141,7 +141,7 @@ if not clusters.empty and {"tsne_x", "tsne_y"}.issubset(clusters.columns):
                      hover_data=["address"], opacity=0.75,
                      color_discrete_sequence=px.colors.qualitative.Bold)
     fig.update_layout(height=460, legend_title="簇标签")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 else:
     st.info("暂无 t-SNE 坐标，请先运行 cluster_analyzer.py")
 
@@ -153,7 +153,7 @@ with col5:
         show = metrics.rename(columns={"model_name": "模型"})
         st.dataframe(show.style.format({
             "auc": "{:.3f}", "f1": "{:.3f}", "precision_": "{:.3f}", "recall": "{:.3f}",
-            "accuracy": "{:.3f}"}), use_container_width=True)
+            "accuracy": "{:.3f}"}), width="stretch")
     else:
         st.info("暂无模型指标，请先运行 churn_model.py")
 with col6:
@@ -164,7 +164,7 @@ with col6:
         fig = px.bar(m, x="model_name", y="值", color="指标", barmode="group",
                      color_discrete_sequence=px.colors.qualitative.Set1)
         fig.update_layout(height=380, xaxis_title="模型")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("暂无数据")
 
@@ -179,7 +179,7 @@ with col7:
         fig = px.bar(agg, x="cluster_label", y="churn_rate", text="n",
                      color="churn_rate", color_continuous_scale="Reds")
         fig.update_layout(height=380, xaxis_title="簇", yaxis_title="实际流失率")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("暂无数据")
 with col8:
@@ -188,7 +188,7 @@ with col8:
         fig = px.histogram(churn.dropna(subset=["churn_prob"]), x="churn_prob", nbins=20,
                            color="is_churned", color_discrete_sequence=["#22c55e", "#ef4444"])
         fig.update_layout(height=380, xaxis_title="预测流失概率", yaxis_title="地址数")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("暂无数据")
 
@@ -203,7 +203,7 @@ with col9:
         fig = px.bar(imp_df, x="importance", y="feature", orientation="h",
                      color="importance", color_continuous_scale="Blues")
         fig.update_layout(height=420, yaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("暂无 SHAP 结果")
 with col10:
@@ -216,7 +216,7 @@ with col10:
         fig = px.bar(sdf, x="shap", y="feature", orientation="h", color="contrast",
                      color_discrete_map={True: "#ef4444", False: "#22c55e"})
         fig.update_layout(height=420, showlegend=False, yaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("暂无单样本 SHAP")
 
@@ -230,7 +230,7 @@ with col11:
         fig = px.bar(fdf, x="freq_bucket", y="churn_rate", text="n",
                      color="churn_rate", color_continuous_scale="OrRd")
         fig.update_layout(height=400, xaxis_title="日交易频次区间", yaxis_title="实际流失率")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("暂无数据")
 
@@ -246,7 +246,7 @@ with col12:
             height=400, xaxis_title="未来天数",
             yaxis=dict(title="人均日交易频次"),
             yaxis2=dict(title="流失率", overlaying="y", side="right", tickformat=".0%"))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("暂无预测数据")
 
@@ -254,7 +254,7 @@ with col12:
 st.subheader("1️⃣3️⃣ 高危地址 TOP 20")
 if not forecast.empty:
     top = forecast.sort_values("forecast_churn_prob", ascending=False).head(20)
-    st.dataframe(top, use_container_width=True, height=360)
+    st.dataframe(top, width="stretch", height=360)
 else:
     st.info("暂无预测数据")
 
@@ -273,14 +273,14 @@ with col14:
                           yaxis=dict(title="交易数"),
                           yaxis2=dict(title="流失率", overlaying="y", side="right",
                                       tickformat=".0%"))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("尚无每日快照，运行 scripts/daily_run.py 后累积")
 with col15:
     st.subheader("1️⃣5️⃣ 管道运行健康")
     if not runs.empty:
         r = runs.sort_values("ran_at", ascending=False).head(20)
-        st.dataframe(r, use_container_width=True, height=360)
+        st.dataframe(r, width="stretch", height=360)
     else:
         st.info("暂无运行记录")
 
