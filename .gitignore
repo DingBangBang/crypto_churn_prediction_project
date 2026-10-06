@@ -22,6 +22,7 @@ data/*.db-journal
 data/*.db-wal
 data/*.db-shm
 data/.bootstrap_*
+data/.pipeline_done
 
 # Generated reports / figures
 reports/*.html
