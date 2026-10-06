@@ -21,6 +21,7 @@ import html
 import json
 import logging
 import re
+import shutil
 import smtplib
 import socket
 import ssl
@@ -120,93 +121,349 @@ def _gmail_access_token() -> str:
     return resp.json()["access_token"]
 
 
+class GmailApiError(RuntimeError):
+    """Gmail API 调用失败；``hint`` 里带上「照着做就能通过」的下一步。"""
+
+    def __init__(self, message: str, *, hint: str = "", status: int = 0):
+        super().__init__(message)
+        self.hint = hint
+        self.status = status
+
+
+def _gmail_api_hint(status: int, body: str) -> str:
+    """把 Google 的英文报错翻译成可执行的中文提示（含需要点开的控制台链接）。
+
+    实测踩过两个：① ``403 … Gmail API has not been used in project … or it is disabled``
+    —— API 没在 Cloud 项目里启用（OAuth 授权本身是好的，只是这个 API 关着）；
+    ② ``401 invalid_grant`` —— refresh token 被撤销/过期。
+    """
+    text = body or ""
+    if ("has not been used in project" in text or "is disabled" in text
+            or "SERVICE_DISABLED" in text or "accessNotConfigured" in text):
+        found = re.search(r"project (\d+)", text)
+        pid = found.group(1) if found else ""
+        suffix = f"?project={pid}" if pid else ""
+        return ("Gmail API 尚未在该 Google Cloud 项目里启用 —— 用浏览器打开下面链接、"
+                "点「启用 / ENABLE」，等 1~2 分钟后重跑即可：\n"
+                f"      https://console.cloud.google.com/apis/library/gmail.googleapis.com{suffix}\n"
+                "      （直连可用：https://console.developers.google.com/apis/api/"
+                f"gmail.googleapis.com/overview{suffix}）\n"
+                f"      项目号：{pid or '（见报错原文）'}")
+    if "invalid_grant" in text or status == 401:
+        return ("refresh token 已失效或被撤销 —— 重新授权一次："
+                "python -m src.notify --oauth-login（本机浏览器打不开 localhost 时用 --oauth-manual）")
+    if "PERMISSION_DENIED" in text or "insufficient" in text.lower():
+        return ("OAuth 授权范围不足 —— 重新授权时确认包含 "
+                "https://www.googleapis.com/auth/gmail.send（本项目默认已含）")
+    return ""
+
+
 def send_email_via_gmail_api(msg: MIMEMultipart) -> bool:
-    """Send a MIME message through ``gmail.googleapis.com`` (needs the GMAIL_* vars)."""
+    """Send a MIME message through ``gmail.googleapis.com`` (needs the GMAIL_* vars).
+
+    失败时抛 :class:`GmailApiError`（带 hint），由 :func:`send_email` 决定是否回退 SMTP。
+    """
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     resp, via = _post_json(config.GMAIL_SEND_URL, {"raw": raw}, timeout=25,
                            headers={"Authorization": f"Bearer {_gmail_access_token()}"})
-    ok = resp.status_code == 200
-    logger.info("Gmail API 邮件%s（经%s）",
-                f"已发送 -> {msg['To']}" if ok else f"失败 {resp.status_code}: {resp.text[:160]}", via)
-    return ok
+    if resp.status_code != 200:
+        raise GmailApiError(f"HTTP {resp.status_code}: {resp.text[:220]}",
+                            hint=_gmail_api_hint(resp.status_code, resp.text),
+                            status=resp.status_code)
+    logger.info("Gmail API 邮件已发送 -> %s（经%s）", msg["To"], via)
+    return True
 
 
-def oauth_login(timeout_s: int = 300) -> int:
-    """One-off helper: walk the Google consent screen and print GMAIL_REFRESH_TOKEN."""
-    import webbrowser
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+def _persist_env_value(key: str, value: str) -> str:
+    """把 ``KEY=VALUE`` 写回 ``environment.env``（保留其它行）；返回文件路径或空串。
 
-    if not (config.GMAIL_CLIENT_ID and config.GMAIL_CLIENT_SECRET):
-        logger.error("请先在 environment.env 里填 GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET")
+    这样 ``--oauth-login`` 才算真正闭环：不用再手动复制粘贴 token。
+    """
+    for name in ("environment.env", "environment .env", ".env"):
+        path = config.PROJECT_ROOT / name
+        if path.exists():
+            break
+    else:
+        return ""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    hit = False
+    for i, line in enumerate(lines):
+        if pattern.match(line):
+            lines[i] = f"{key}={value}"
+            hit = True
+    if not hit:
+        lines.append(f"{key}={value}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def parse_oauth_redirect(text: str) -> Dict[str, str]:
+    """从「回调 URL」或「纯授权码」里解析出 ``code`` / ``error``。
+
+    浏览器停在 ``http://localhost:8765/?code=...`` 时，把地址栏整条 URL 贴进来即可。
+    """
+    text = (text or "").strip().strip('"').strip("'")
+    if not text:
+        return {}
+    if "=" in text:                      # URL 或 query string
+        query = urllib.parse.urlsplit(text).query or text.lstrip("?")
+        return {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+    return {"code": text}                # 直接粘授权码
+
+
+def _finish_oauth(code: str, redirect: str, write_env: bool = True) -> int:
+    """用授权码换 ``refresh_token``：打印 + 自动写回 environment.env。"""
+    resp = requests.post(config.GOOGLE_TOKEN_URL, data={
+        "client_id": config.GMAIL_CLIENT_ID, "client_secret": config.GMAIL_CLIENT_SECRET,
+        "code": code, "grant_type": "authorization_code",
+        "redirect_uri": redirect}, timeout=20, proxies=_proxies())
+    if resp.status_code != 200:
+        logger.error("换取 token 失败 %s: %s", resp.status_code, resp.text[:300])
+        if "invalid_grant" in resp.text:
+            logger.error("授权码只能兑换一次且 10 分钟内有效：请重新跑 --oauth-login "
+                         "拿一个新的 code（或 --oauth-manual 粘贴新 URL）。")
         return 1
-    redirect = config.GMAIL_REDIRECT_URI
+    token = resp.json()
+    refresh = token.get("refresh_token", "")
+    print(f"\nGMAIL_REFRESH_TOKEN={refresh}\n")
+    if not refresh:
+        print("⚠️ 未返回 refresh_token：到 Google 账号「安全 → 第三方应用」撤销本应用后重试一次。\n")
+        return 1
+    if write_env and _persist_env_value("GMAIL_REFRESH_TOKEN", refresh):
+        logger.info("已写入 environment.env：GMAIL_REFRESH_TOKEN=***（%d 字符）", len(refresh))
+    elif write_env:
+        logger.warning("未找到 env 文件，请手动把上面这行写进 environment.env")
+    else:
+        logger.info("已跳过写回 env（--no-write），请手动复制上面那行")
+    logger.info("OAuth 闭环完成：现在可以 python -m src.notify 发信了")
+    # 让**当前进程**立刻用上新 token（否则后续步骤仍在用旧 scope 的旧 token）。
+    config.GMAIL_REFRESH_TOKEN = refresh
+    return 0
+
+
+def _gmail_project_number(token: str) -> str:
+    """用一次「发信探测」读出 Google Cloud 项目号；API 已启用时返回空串。
+
+    为什么不用 ``getProfile``：只带 ``gmail.send`` scope 的 token 访问它会得到
+    「insufficient authentication scopes」，读不到项目号；而**发信端点**会先做
+    「API 是否启用」的检查，正好把 ``project <号码>`` 写在 403 报错里。
+    探测用的是一封空邮件体（API 禁用时不会真发信）。
+    """
+    raw = base64.urlsafe_b64encode(b"To: me\r\nSubject: probe\r\n\r\n").decode()
+    resp, _ = _post_json(config.GMAIL_SEND_URL, {"raw": raw}, timeout=20,
+                         headers={"Authorization": f"Bearer {token}"})
+    if resp.status_code == 200:
+        return ""                                  # 竟然发出去了 ⇒ 已启用
+    found = re.search(r"project (\d+)", resp.text or "")
+    return found.group(1) if found else ""
+
+
+def _gmail_api_ready(token: str) -> bool:
+    """Gmail API 是否已启用（用 ``getProfile`` 探测；需要 token 带较宽 scope）。"""
+    resp, _ = _get_json(config.GMAIL_PROFILE_URL, timeout=20,
+                        headers={"Authorization": f"Bearer {token}"})
+    return resp.status_code == 200
+
+
+def enable_gmail_api(access_token: str | None = None, wait_s: int = 180) -> bool:
+    """自愈 403：调 Service Usage API 在项目里**启用** Gmail API，然后轮询到生效为止。
+
+    需要一次性授权带上 ``cloud-platform`` scope（``--enable-gmail-api`` 会带上）；
+    没有权限时会返回 403，此时按日志里的链接手动启用即可。
+    """
+    token = access_token or _gmail_access_token()
+    project = _gmail_project_number(token)
+    if not project:
+        logger.info("Gmail API 已是启用状态，无需处理")
+        return True
+    url = config.SERVICEUSAGE_ENABLE_URL.format(project=project)
+    try:
+        resp, via = _post_json(url, {}, timeout=30,
+                               headers={"Authorization": f"Bearer {token}"})
+    except Exception as exc:  # pragma: no cover - 网络相关
+        logger.error("调用 Service Usage API 失败: %s", exc)
+        return False
+    if resp.status_code in (200, 201, 409):        # 409 = 已启用
+        logger.info("已提交「启用 Gmail API」请求（项目 %s，经%s），等待生效…", project, via)
+    elif resp.status_code == 403:
+        logger.error("没有权限启用 Gmail API（需项目 Owner / Service Usage Admin）——手动启用："
+                     "https://console.cloud.google.com/apis/library/gmail.googleapis.com"
+                     "?project=%s\n  返回：%s", project, resp.text[:200])
+        return False
+    else:
+        logger.error("启用 Gmail API 失败 %s: %s", resp.status_code, resp.text[:200])
+        return False
+
+    deadline = time.time() + max(wait_s, 30)
+    while time.time() < deadline:
+        time.sleep(10)
+        if _gmail_api_ready(token):                # profile 读得到 => 已生效
+            logger.info("✅ Gmail API 已启用并生效（项目 %s）", project)
+            return True
+    logger.warning("已提交启用请求，但 %ds 内尚未生效；等 1~2 分钟直接重跑即可（无需再点任何页面）",
+                   wait_s)
+    return False
+
+
+def enable_gmail_api_flow(manual: bool = False, write_env: bool = True) -> int:
+    """一条命令做完「启用 Gmail API + 发信自检」：``--enable-gmail-api``。
+
+    步骤：① 重新授权一次（scope 多加 ``cloud-platform``，仅用于启用 API）
+         ② 代码调 Service Usage API 启用 gmail.googleapis.com（轮询到生效）
+         ③ 立刻发一封自检邮件，把结果打印出来
+    """
+    logger.info("将重新授权一次：scope 增加 cloud-platform（仅用于自动启用 Gmail API，"
+                "不想授权可直接去 Cloud Console 点「启用」，见 403 日志里的链接）")
+    rc = oauth_login(timeout_s=900, manual=manual, write_env=write_env, enable_api=True)
+    if rc != 0:
+        return rc
+    enabled = enable_gmail_api()
+    body = ("<p>这封邮件说明 Gmail 邮件通道已打通：OAuth2 授权 → API 启用 → 发信，"
+            "整条链路 OK。</p>"
+            f"<p>发送时间：{time.strftime('%Y-%m-%d %H:%M:%S')}</p>")
+    sent = send_email("[测试] ✅ Gmail API 通道自检 · 加密用户流失预警", body)
+    logger.info("自检结果：API 启用=%s ｜ 邮件发送=%s", enabled, sent)
+    return 0 if sent else 1
+
+
+def _serve_callback(redirect: str, timeout_s: int = 300) -> Dict[str, str]:
+    """在回调端口等 Google 跳回来，返回 query 参数（含 ``code``）。
+
+    两个「必须做对」的细节（曾经导致浏览器 ERR_CONNECTION_REFUSED）：
+    1. **IPv4/IPv6 双栈监听**：macOS 上 Chrome 把 ``localhost`` 解析成 ``::1``，
+       若只绑 ``127.0.0.1`` 就会拒连 —— 这里用 ``::`` + ``IPV6_V6ONLY=0`` 同时覆盖两者。
+    2. **忽略杂包**：浏览器可能先请求 ``/favicon.ico`` 等；老实现用
+       ``handle_request()`` 只服务一个连接，杂包会把真正的回调吃掉、服务随即关闭。
+       这里循环服务，只有拿到 ``code``/``error`` 才退出。
+    """
+    import socket
+    from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+
     parsed = urllib.parse.urlsplit(redirect)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 80
     captured: Dict[str, str] = {}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            if "code" not in query and "error" not in query:
+                self.send_response(204)          # 杂包：不消费回调
+                self.end_headers()
+                return
             captured.update({k: v[0] for k, v in query.items()})
+            body = ("<h3>授权完成，请回到终端。</h3>"
+                    "<p>窗口可以关闭了。</p>").encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write("<h3>授权完成，请回到终端。</h3>".encode("utf-8"))
+            self.wfile.write(body)
 
-        def log_message(self, *args):  # keep the console clean
+        def log_message(self, *args):        # 保持终端干净
             return
 
+    class DualStackServer(ThreadingHTTPServer):
+        """双栈监听：同时接受 127.0.0.1 与 ::1（localhost 的两种解析）。"""
+
+        daemon_threads = True
+        address_family = socket.AF_INET6
+
+        def server_bind(self):
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except OSError:                  # 没有 IPv6 就退化为纯 IPv4
+                pass
+            super().server_bind()
+
+    try:
+        server = DualStackServer(("::", port), Handler) if host in ("localhost", "::1") \
+            else HTTPServer((host, port), Handler)
+    except OSError as exc:
+        if host in ("localhost", "::1"):
+            logger.warning("IPv6 双栈监听失败（%s），退化为 127.0.0.1", exc)
+            server = HTTPServer(("127.0.0.1", port), Handler)
+        else:
+            raise
+    logger.info("回调服务器已监听 %s:%s（等待 Google 跳转回来）", host, port)
+    server.timeout = 1
+    deadline = time.time() + max(timeout_s, 30)
+    while not captured and time.time() < deadline:
+        server.handle_request()
+    server.server_close()
+    return captured
+
+
+def oauth_login(timeout_s: int = 300, manual: bool = False, write_env: bool = True,
+                enable_api: bool = False) -> int:
+    """One-off helper: walk the Google consent screen and print GMAIL_REFRESH_TOKEN.
+
+    默认走「本地回调服务器」自动闭环；``manual=True``（``--oauth-manual``）则跳过服务器：
+    浏览器若打不开 ``localhost:8765``，把地址栏里的整条回调 URL 粘进来即可兑换。
+    ``enable_api=True`` 会额外申请 ``cloud-platform`` scope，好让
+    :func:`enable_gmail_api` 自动把 Gmail API 启用（见 ``--enable-gmail-api``）。
+    """
+    import threading
+
+    if not (config.GMAIL_CLIENT_ID and config.GMAIL_CLIENT_SECRET):
+        logger.error("请先在 environment.env 里填 GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET")
+        return 1
+    redirect = config.GMAIL_REDIRECT_URI
+    scope = config.GMAIL_SCOPE + (f" {config.GMAIL_ENABLE_SCOPE}" if enable_api else "")
     url = config.GOOGLE_AUTH_URL + "?" + urllib.parse.urlencode({
         "client_id": config.GMAIL_CLIENT_ID, "redirect_uri": redirect,
-        "response_type": "code", "scope": config.GMAIL_SCOPE,
+        "response_type": "code", "scope": scope,
         "access_type": "offline", "prompt": "consent"})
-    server = HTTPServer((parsed.hostname or "localhost", parsed.port or 80), Handler)
-    server.timeout = timeout_s
-    logger.info("已打开浏览器完成一次性授权；若未自动打开请手动访问:\n%s", url)
-    try:
-        webbrowser.open(url)
-    except Exception:  # pragma: no cover
-        pass
-    server.handle_request()                 # blocks until Google bounces back
-    server.server_close()
-    if "code" not in captured:
-        logger.error("未拿到授权码（超时或被拒绝）: %s", captured.get("error", "timeout"))
-        return 1
 
-    resp = requests.post(config.GOOGLE_TOKEN_URL, data={
-        "client_id": config.GMAIL_CLIENT_ID, "client_secret": config.GMAIL_CLIENT_SECRET,
-        "code": captured["code"], "grant_type": "authorization_code",
-        "redirect_uri": redirect}, timeout=20, proxies=_proxies())
-    if resp.status_code != 200:
-        logger.error("换取 token 失败 %s: %s", resp.status_code, resp.text[:200])
-        return 1
-    token = resp.json()
-    print("\n把下面这行写入 environment.env（该文件已被 .gitignore 忽略）:\n")
-    print(f"GMAIL_REFRESH_TOKEN={token.get('refresh_token', '')}\n")
-    if not token.get("refresh_token"):
-        print("⚠️ 未返回 refresh_token：请到 Google 账号「第三方访问」中撤销本应用后重试一次。\n")
-    return 0
-
-
-def send_email(subject: str, html_body: str, to: str | None = None) -> bool:
-    to = to or config.ALERT_EMAIL_TO
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = config.SMTP_USER or config.ALERT_EMAIL_TO
-    msg["To"] = to
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-    # Prefer the OAuth2 Gmail API when it is configured (Google 已下线应用专用密码）。
-    if config.GMAIL_CLIENT_ID and config.GMAIL_CLIENT_SECRET and config.GMAIL_REFRESH_TOKEN:
+    if manual:
+        print("\n1) 在浏览器打开下面这个地址并同意授权：\n")
+        print(url + "\n")
+        print(f"2) 授权后浏览器会跳到 {redirect}?code=...（页面打不开也没关系），")
+        print("   把地址栏里的整条 URL 粘贴到这里后回车：\n")
         try:
-            return send_email_via_gmail_api(msg)
-        except Exception as exc:
-            logger.error("Gmail API 发信失败: %s", exc)
-            return False
+            pasted = input("回调 URL（或授权码）> ").strip()
+        except EOFError:
+            pasted = ""
+        query = parse_oauth_redirect(pasted)
+        if "error" in query:
+            logger.error("授权被拒绝: %s", query["error"])
+            return 1
+        if "code" not in query:
+            logger.error("没解析到授权码，请重试（贴完整 URL 或 code 值）")
+            return 1
+        return _finish_oauth(query["code"], redirect, write_env=write_env)
 
-    if not (config.SMTP_USER and config.SMTP_PASS):
-        logger.warning("邮件未发送：缺少凭证（需 GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN "
-                       "或 SMTP_USER/SMTP_PASS）")
-        return False
+    # 先起回调服务器，再开浏览器（避免「浏览器已跳回、端口还没监听」的竞态）。
+    holder: Dict[str, str] = {}
+
+    def _serve() -> None:
+        try:
+            holder.update(_serve_callback(redirect, timeout_s))
+        except OSError as exc:               # 端口被占用等：别让线程静默死掉
+            holder["_error"] = str(exc)
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    time.sleep(0.4)                          # 让监听就绪
+    if "_error" in holder:                   # 起不来就直接转手动模式，链路不断
+        logger.warning("回调服务器不可用（%s），转 --oauth-manual 模式", holder["_error"])
+        return oauth_login(timeout_s, manual=True, write_env=write_env)
+    logger.info("已打开浏览器完成一次性授权；若未自动打开请手动访问:\n%s", url)
+    open_browser(url)
+    thread.join()
+    if "error" in holder:
+        logger.error("授权被拒绝: %s", holder["error"])
+        return 1
+    if "code" not in holder:
+        logger.error("未拿到授权码（超时 / 浏览器连不上 localhost）——"
+                     "改用无回调模式重试：python -m src.notify --oauth-manual")
+        return 1
+    return _finish_oauth(str(holder["code"]), redirect, write_env=write_env)
+
+
+def _send_email_via_smtp(msg: MIMEMultipart, to: str) -> bool:
+    """SMTP 通道（``smtp.gmail.com:465``，可用 ``SMTP_PROXY`` 走代理隧道）。"""
     try:
         ctx = ssl.create_default_context()
         if config.SMTP_PROXY:
@@ -226,7 +483,8 @@ def send_email(subject: str, html_body: str, to: str | None = None) -> bool:
             server.sendmail(config.SMTP_USER, [to], msg.as_string())
         finally:
             server.close()
-        logger.info("预警邮件已发送 -> %s", to)
+        logger.info("预警邮件已发送（SMTP %s:%s）-> %s", config.SMTP_HOST,
+                    config.SMTP_PORT, to)
         return True
     except smtplib.SMTPAuthenticationError as exc:
         detail = exc.smtp_error
@@ -237,8 +495,47 @@ def send_email(subject: str, html_body: str, to: str | None = None) -> bool:
                      "  · 若确认密码正确，请检查 SMTP_PROXY 是否可用。", detail.strip())
         return False
     except Exception as exc:  # pragma: no cover - depends on external SMTP
-        logger.error("邮件发送失败: %s", exc)
+        logger.error("邮件发送失败（SMTP）: %s", exc)
         return False
+
+
+def send_email(subject: str, html_body: str, to: str | None = None) -> bool:
+    """发一封 HTML 告警邮件：**优先 Gmail API（OAuth2），失败自动回退 SMTP**。
+
+    两条通道都失败时，日志里会给出「照着做就能通过」的下一步（见 :func:`_gmail_api_hint`），
+    例如 Gmail API 未启用时直接给出 Cloud Console 的启用链接。
+    """
+    to = to or config.ALERT_EMAIL_TO
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = config.SMTP_USER or config.ALERT_EMAIL_TO
+    msg["To"] = to
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    has_api = bool(config.GMAIL_CLIENT_ID and config.GMAIL_CLIENT_SECRET
+                   and config.GMAIL_REFRESH_TOKEN)
+    has_smtp = bool(config.SMTP_USER and config.SMTP_PASS)
+
+    if has_api:
+        try:
+            return send_email_via_gmail_api(msg)
+        except GmailApiError as exc:
+            logger.error("Gmail API 发信失败 %s", exc)
+            if exc.hint:
+                logger.error("👉 处理办法：%s", exc.hint)
+        except Exception as exc:  # pragma: no cover - 网络相关
+            logger.error("Gmail API 发信失败: %s", exc)
+        if not has_smtp:
+            logger.warning("没有备用 SMTP 凭证（SMTP_USER/SMTP_PASS），本次邮件未发出；"
+                           "按上面的提示修好后重试即可")
+            return False
+        logger.warning("自动回退 SMTP 通道重发（%s:%s）…", config.SMTP_HOST, config.SMTP_PORT)
+
+    if not has_smtp:
+        logger.warning("邮件未发送：缺少凭证（需 GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN "
+                       "或 SMTP_USER/SMTP_PASS）")
+        return False
+    return _send_email_via_smtp(msg, to)
 
 
 # --- egress proxy + HTTP helpers ----------------------------------------------
@@ -269,6 +566,25 @@ def _post_json(url: str, payload: dict, timeout: int = 15, prefer_proxy: bool = 
         try:
             return requests.post(url, json=payload, timeout=timeout,
                                  proxies=proxies, headers=headers), label
+        except Exception as exc:  # pragma: no cover - network dependent
+            last = exc
+            logger.warning("%s 经%s请求失败: %s", urllib.parse.urlsplit(url).netloc, label, exc)
+    raise last if last else RuntimeError("请求失败")
+
+
+def _get_json(url: str, timeout: int = 20, headers: Dict[str, str] | None = None):
+    """GET with the same 代理优先 → 直连 回退策略（见 :func:`_post_json`）。
+
+    返回 ``(response, "代理"|"直连")``。
+    """
+    proxy_map = _proxies()
+    order = [(proxy_map, "代理"), (None, "直连")] if proxy_map else [(None, "直连")]
+
+    last: Exception | None = None
+    for proxies, label in order:
+        try:
+            return requests.get(url, timeout=timeout, proxies=proxies,
+                                headers=headers), label
         except Exception as exc:  # pragma: no cover - network dependent
             last = exc
             logger.warning("%s 经%s请求失败: %s", urllib.parse.urlsplit(url).netloc, label, exc)
@@ -316,6 +632,59 @@ def send_lark(text: str) -> bool:
 def send_lark_card(card: Dict[str, object]) -> bool:
     """Markdown 消息卡片推送（``msg_type=interactive`` + ``lark_md``，支持加粗/彩色标题）。"""
     return _post_lark({"msg_type": "interactive", "card": card}, kind="卡片")
+
+
+def open_browser(url: str) -> bool:
+    """把 ``url`` 交给系统默认浏览器打开；返回是否**真的**唤起成功。
+
+    为什么不用一句 ``webbrowser.open``：macOS 上 Python 的 ``webbrowser`` 默认走
+    ``osascript``（= 需要「自动化」授权），终端/iTerm/IDE 没被授权时会**静默失败**
+    （只返回 False，屏幕上什么都不会发生）；而 ``/usr/bin/open`` 走 LaunchServices，
+    任何进程都能用。所以这里按顺序尝试并把「哪条成功」写进日志：
+
+      macOS : ``open <url>`` → ``open -a "Google Chrome" <url>`` → ``webbrowser``
+      Linux : ``xdg-open <url>`` → ``webbrowser``
+      其它   : ``webbrowser``
+
+    全失败时打印可手动访问的链接（容器里调用请先用 ``--no-open`` / ``CHURN_HEADLESS=1``
+    跳过，见 ``src/deliver.py``）。
+    """
+    target = str(url or "").strip()
+    if not target:
+        return False
+    if not target.startswith(("http://", "https://", "file://", "x-apple.")):
+        target = "file://" + str(Path(target).expanduser().resolve())
+
+    attempts: List[Tuple[str, List[str]]] = []
+    if sys.platform == "darwin":
+        attempts.append(("open（默认浏览器）", ["open", target]))
+        if Path("/Applications/Google Chrome.app").exists():
+            attempts.append(("open -a 'Google Chrome'", ["open", "-a", "Google Chrome", target]))
+    elif shutil.which("xdg-open"):
+        attempts.append(("xdg-open", ["xdg-open", target]))
+
+    for label, cmd in attempts:
+        try:
+            proc = subprocess.run(cmd, check=False, timeout=15,
+                                  capture_output=True, text=True)
+            if proc.returncode == 0:
+                logger.info("已唤起浏览器（%s）：%s", label, target)
+                return True
+            logger.warning("%s 唤起失败（exit=%s）：%s", label, proc.returncode,
+                           ((proc.stderr or proc.stdout or "").strip() or "无输出")[:160])
+        except Exception as exc:  # pragma: no cover - 平台相关
+            logger.warning("%s 唤起异常: %s", label, exc)
+
+    try:                                     # 最后兜底：Python 自己的 webbrowser
+        import webbrowser
+        if webbrowser.open(target):
+            logger.info("已唤起浏览器（webbrowser 兜底）：%s", target)
+            return True
+    except Exception as exc:  # pragma: no cover - 平台相关
+        logger.warning("webbrowser 兜底唤起失败: %s", exc)
+
+    logger.error("自动打开浏览器失败（不是致命错误），请手动复制访问：%s", target)
+    return False
 
 
 def notify_macos(message: str, title: str = "加密用户流失预警",
@@ -1140,11 +1509,63 @@ def main(argv: List[str] | None = None) -> int:
 
     ``python -m src.notify --preview``      → render only (no network): writes the e-mail HTML
                                               and the Lark card JSON under ``reports/``
-    ``python -m src.notify --oauth-login`` → one-off Google consent, prints the refresh token
+    ``python -m src.notify --oauth-login`` → one-off Google consent (local callback server),
+                                              prints **and writes** the refresh token
+    ``python -m src.notify --oauth-manual``→ same, but you paste the redirect URL back into the
+                                              terminal (use when the browser cannot reach
+                                              ``localhost:8765``)
+    ``python -m src.notify --oauth-exchange "<redirect URL or code>"``
+                                            → exchange an already-issued code (finish a
+                                              half-completed consent)
+    ``python -m src.notify --open-test``    → 只做一件事：验证「能不能自动唤起浏览器」
+                                              （生成本地测试页并尝试打开，打印命中哪条策略）
+    ``python -m src.notify --enable-gmail-api``
+                                            → 一次性把 Gmail 邮件通道修到能用：
+                                              重新授权（scope 加 cloud-platform）→ 代码自动
+                                              启用 Gmail API（自愈 403）→ 发信自检。
+                                              之后重试发信用 ``--only-email``（不打扰 Lark）。
+    附加开关：``--no-write`` 不写回 environment.env；``--only-email`` 只发邮件。
     """
     argv = list(sys.argv[1:] if argv is None else argv)
-    if "--oauth-login" in argv:
-        return oauth_login()
+    if "--open-test" in argv:
+        idx = argv.index("--open-test")
+        target = argv[idx + 1] if len(argv) > idx + 1 else ""
+        if not target:
+            page = config.REPORTS_DIR / "open_test.html"
+            page.write_text(
+                "<!doctype html><meta charset='utf-8'><title>自动打开测试</title>"
+                "<body style='font:16px/1.7 -apple-system,sans-serif;padding:40px'>"
+                "<h2>✅ 自动唤起浏览器成功</h2>"
+                "<p>如果你能看到这一页，说明 <code>src/notify.py: open_browser()</code> "
+                "在本机工作正常：</p><ol><li>macOS 上优先用 <code>/usr/bin/open</code>"
+                "（LaunchServices，不依赖「自动化」授权）；</li>"
+                "<li>失败再退到 <code>open -a \"Google Chrome\"</code>；</li>"
+                "<li>最后才用 Python 的 <code>webbrowser</code>（osascript）。</li></ol>"
+                f"<p>生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}</p></body>",
+                encoding="utf-8")
+            target = str(page)
+        ok = open_browser(target)
+        logger.info("--open-test 结果：%s（目标 %s）",
+                    "成功" if ok else "失败（请手动复制上面的链接）", target)
+        return 0 if ok else 1
+    if "--enable-gmail-api" in argv:
+        return enable_gmail_api_flow(manual="--oauth-manual" in argv,
+                                     write_env="--no-write" not in argv)
+    if "--oauth-login" in argv or "--oauth-manual" in argv:
+        return oauth_login(manual="--oauth-manual" in argv,
+                           write_env="--no-write" not in argv)
+    if "--oauth-exchange" in argv:
+        idx = argv.index("--oauth-exchange")
+        value = argv[idx + 1] if len(argv) > idx + 1 else ""
+        query = parse_oauth_redirect(value)
+        if "error" in query:
+            logger.error("授权被拒绝: %s", query["error"])
+            return 1
+        if "code" not in query:
+            logger.error("用法：python -m src.notify --oauth-exchange \"<回调URL或code>\"")
+            return 1
+        return _finish_oauth(query["code"], config.GMAIL_REDIRECT_URI,
+                             write_env="--no-write" not in argv)
 
     summary = _report_summary()
     digest = collect_cluster_digest()
@@ -1168,7 +1589,11 @@ def main(argv: List[str] | None = None) -> int:
     subject = (f"[测试] ⚠️ 加密用户流失预警 · 流失率 {context['churn_rate']}"
                f" · 高危占比 {context['high_risk_ratio']}")
     email_ok = send_email(subject, render_email(context))
-    lark_ok = _send_lark_digest_payload(summary, risk_ratio, digest=digest, status=status)
+    lark_ok = False
+    if "--only-email" in argv:
+        logger.info("--only-email：跳过 Lark 推送（重试发信时避免刷屏）")
+    else:
+        lark_ok = _send_lark_digest_payload(summary, risk_ratio, digest=digest, status=status)
     print(build_digest_text(summary, risk_ratio, digest=digest, status=status))
     logger.info("测试推送结果: email=%s, lark=%s", email_ok, lark_ok)
     return 0 if (email_ok or lark_ok) else 1

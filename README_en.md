@@ -24,7 +24,7 @@ churn rates · cluster personas · business insights · suggested next actions.*
   macOS notification (**click opens the run-status page**)
 - **Run-status page**: `reports/status.html` (three channels + result content + error details,
   just double-click it locally)
-- **Delivery**: a single Docker image; `docker compose up` runs the whole pipeline and opens the dashboard
+- **Delivery**: a single Docker image; `docker compose up` (or `./start.sh`) = pipeline **plus all four outputs** (e-mail/Lark/status page/snapshot) plus the dashboard, in one command
 
 > ⚠️ **Sample size (important)**: the real 24h-active node set is ~**12000** addresses and it is
 > **not runnable on a laptop** (a free Etherscan key allows ≈5 requests/second; even 2000
@@ -33,6 +33,44 @@ churn rates · cluster personas · business insights · suggested next actions.*
 > ARIMA → e-mail/Lark/dashboard can run **end to end**. Once an internal Etherscan API (or a
 > self-hosted archive node) is available, set `ADDRESS_LIMIT=12000` and widen `MONTHS_BACK` —
 > **the code path is identical**.
+
+## 🎯 What the numbers actually mean (read the ruler first)
+
+> Every figure is only valid **inside its scope** — change any one dimension and the answer has to be recomputed.
+
+| Dimension | This project | Env key | Meaning |
+| --- | --- | --- | --- |
+| **Look-back window** | last **6 months** | `MONTHS_BACK=6` | only transactions after `now-6M` feed the features |
+| **Churn label** | **no transaction for 30 days** | `CHURN_DAYS=30` | `last_tx_days_ago > 30` ⇒ labelled "churned" |
+| **Forecast horizons** | 30-day main + a 1/7/14/30/90-day set | `FORECAST_HORIZON_DAYS`, `FORECAST_HORIZONS` | one ARIMA fit emits per-day activity frequency **and** cumulative churn rate per horizon |
+| **Chain / asset** | Ethereum mainnet (`CHAIN_ID=1`), **ETH + ERC-20** | `CHAIN_ID`, `ETHERSCAN_API_BASE_URL` | Etherscan V2 is multi-chain: change `CHAIN_ID` for BSC / Polygon / Arbitrum |
+| **Cohort** | 10 high-activity **seed addresses** (exchange hot wallets / whales / infra) → BFS over counterparties → first `ADDRESS_LIMIT` | `ADDRESS_LIMIT=2000`, `SEED_ADDRESSES` | this run = **2000 addresses**: a seed-centred active sub-graph, not "all Ethereum users" |
+| **Product line / trade types** | normal `txlist` + internal `txlistinternal` + **ERC-20 transfer** `tokentx` | fixed in the fetch stage | no NFT, no contract-internal events, no bridge cross-chain volume |
+| **Risk definition** | high-risk cluster share + threshold-multiple tiers | `ALERT_RISK_CLUSTER_RATIO=0.25`, `RISK_*_MULTIPLIER` | high-risk clusters = "high-frequency arbitrageur / noise·bot"; tier = predicted churn ÷ threshold (0.75× / 1.0× / 1.5×) |
+
+**Single run — what each figure buys you**
+
+| Output | Meaning | How to use it |
+| --- | --- | --- |
+| Predicted churn 18.0% (30d) | ~18% of these 2000 active addresses are expected to go quiet within 30 days | size the win-back campaign (reach ≈ 18% × active base) |
+| High-risk share 32.1% | roughly a third of addresses sit in the high-churn arbitrageur/bot clusters | screen sybil/abuse traffic first — don't spend retention budget on it |
+| 1940 addresses → 34 clusters | the persona layering (label + share + radar chart) | segment playbooks: keep whales, clean noise, re-incentivise DeFi farmers |
+| SHAP top features | *why* they churn (e.g. `token_tx_ratio`, `eth_balance_end`) | choose the win-back message and the channel |
+| 1/7/14/30/90-day set | acceleration / deceleration signal, short vs long window | short > long = accelerating exit, act within 48h |
+
+**Long term — this is how a run becomes a data asset**
+
+- every run writes the day's numbers into `daily_snapshots` and keeps `reports/last_run.json`;
+- after N days you can plot **retention curves, churn-rate trends and model back-tests** on an
+  identical definition — one run gives a verdict, many runs give a trend;
+- `scripts/daily_run.py` (see "Daily scheduling") is the collector that turns runs into an asset.
+
+**Known boundaries (read before quoting the numbers)**
+
+1. **Sample size** — 2000 addresses is a feasibility run; the real active set is ~12000 (needs the internal Etherscan API or an archive node);
+2. **Rate limits** — a free Etherscan key allows ≈5 req/s, so 2000 addresses take hours (see "Want a 24h / longer window?");
+3. **The definition is ours, not the company's** — align "active / churn / high-risk" before acting on it;
+4. **Granularity** — address-level only; no natural-person or entity resolution.
 
 ---
 
@@ -80,11 +118,12 @@ crypto_churn_prediction_project/
 │   ├── cluster_analyzer.py  # ③ clustering
 │   ├── churn_model.py       # ④ churn + SHAP + ARIMA (1/7/14/30/90-day windows)
 │   ├── notify.py            # e-mail / Lark card / macOS alert + digest & suggestions
+│   ├── deliver.py           # the four-output delivery layer (shared by daily_run & container --deliver)
 │   └── status_page.py       # run-status page reports/status.html (opened by notifications)
 ├── app/dashboard.py         # ⑤ Streamlit, 16 panels
 ├── scripts/
-│   ├── run_pipeline.py      # runs ①→④ in one go
-│   └── daily_run.py         # daily 15:30 schedule + snapshot + alerts + status page
+│   ├── run_pipeline.py      # runs ①→④ in one go (container first boot adds --deliver)
+│   └── daily_run.py         # daily 15:30 schedule / four outputs / snapshot (--deliver-only to re-send)
 ├── templates/alert_email.html  # alert e-mail HTML ({{placeholders}})
 ├── reports/                 # artefacts: charts / HTML report / status.html / email_preview.html / lark_card.json
 ├── docs/
@@ -116,22 +155,69 @@ docker run -d --name crypto-churn-app -p 8501:8501 \
 # open http://localhost:8501
 ```
 
-### Option B: `docker compose up` in one command (recommended)
+### Option B: one command — `./start.sh` (recommended)
 
 ```bash
 # 1) prepare env vars
 cp environment.env.example environment.env
 #    edit environment.env: set ETHERSCAN_API_KEY (optionally ADDRESS_LIMIT / e-mail / Lark)
 
-# 2) one shot: build → first boot runs the full pipeline → start dashboard → open browser
+# 2) one shot: build → first boot runs the pipeline → delivers all four outputs
+#    → start dashboard → auto-open the status page and the dashboard
 ./start.sh
-#    equivalent to: docker compose up -d --build  then  open http://localhost:8501
+#    same as: docker compose up -d --build (with progress) + auto-open
+#             http://localhost:8501 (dashboard) and ./reports/status.html (run status)
 ```
 
-On **first boot** `docker-entrypoint.sh` runs, in order:
-`data_fetcher → feature_engineer → cluster_analyzer → churn_model → streamlit run app/dashboard.py`
-and persists everything into the in-container database. Later restarts go straight to the
-dashboard (a marker file decides; set `FORCE_PIPELINE=1` to force a re-run).
+**You can actually see the progress** (nothing runs silently in the background):
+
+```
+============================================================
+ 🪙 Crypto user behaviour clustering & churn prediction · pipeline
+Steps: ① fetch → ② features → ③ clustering → ④ prediction → ⑤ deliver 4 channels
+============================================================
+[1/5] ▶ Fetching on-chain transactions (Etherscan) …
+已抓取 1240/2000 地址 [█████████████░░░░░░░░░░░]  62% 1240/2000 抓取地址 | 新增 715382 条 | 队列 813 | 用时 9432s
+✅ [1/5] 抓取链上交易（Etherscan）完成（23401.2s，总耗时 23401s）
+[2/5] ▶ Feature engineering (six families) …
+```
+
+- `./start.sh` **streams the container log into your terminal** (stage numbers + progress bar +
+  percentages) and opens the status page & dashboard when the run finishes;
+- or run it in the foreground: `docker compose up --build` (log is visible by definition);
+- background is fine too: `docker compose logs -f churn-app` whenever you want to watch.
+
+On **first boot** `docker-entrypoint.sh` does, in order:
+
+```
+data_fetcher → feature_engineer → cluster_analyzer → churn_model
+        → --deliver (e-mail + Lark card + reports/status.html + snapshot/last_run.json)
+        → streamlit run app/dashboard.py
+```
+
+Later restarts go straight to the dashboard (a marker file decides; set
+`FORCE_PIPELINE=1` to force a re-run). If you only want to **re-send** the outputs at that
+point, the container runs `scripts/daily_run.py --deliver-only`, which reuses the existing
+`churn_summary.json` — no stages re-run, nothing is re-fetched.
+
+**Key point: compose/container produce + push; the host fires the notification and opens pages**
+
+| Action | Who does it | Notes |
+| --- | --- | --- |
+| e-mail / Lark card / status page generation | **inside the container** (`run_pipeline.py --deliver`) | shares `src/deliver.py` with the local `daily_run.py`, so **identical figures** |
+| status page on disk | container writes `/app/reports/status.html` → bind-mounted to host `./reports/status.html` | double-click it on the host |
+| macOS notification | **host** (end of `start.sh` / `daily_run.py`) | no GUI in the container; with `CHURN_HEADLESS=1` the delivery layer just logs a line |
+| open dashboard / open status page | **host** (`start.sh`) | `open`/`webbrowser` are no-ops inside a container |
+
+- Data only, no pushing: `RUN_DELIVER=0 ./start.sh`
+- Don't auto-open a browser (CI / remote shell): `NO_OPEN=1 ./start.sh`
+- Full 2000-address validation: `ADDRESS_LIMIT=2000 ./start.sh`
+- Re-send once from inside the container: `docker compose exec churn-app python scripts/daily_run.py --deliver-only`
+- Stop: `docker compose down` (data stays in `./data`, reports in `./reports`)
+
+> Dashboard: open <http://localhost:8501> (Streamlit, no login). If no tab pops up when
+> `./start.sh` ends, it prints the **exact opener it used** plus the `file://` / `http://` links —
+> copy them; self-check with `python -m src.notify --open-test`.
 
 ### Option C: run the scripts step by step (local conda, easiest to debug)
 
@@ -165,6 +251,26 @@ python scripts/daily_run.py --dry-run   # simulate the daily job (no network fet
 > polluted. The local feasibility run uses `2000` (several hours under the free Etherscan rate
 > limit); the **full ~12000-node run** needs the internal Etherscan API / an archive node —
 > just set `ADDRESS_LIMIT=12000`.
+
+### 🔧 Want a 24h window, a longer horizon or a bigger sample? Edit `environment.env`
+
+Every definition lives in **`environment.env`** (template: `environment.env.example`):
+
+| Goal | Env key | Default | Suggested value / note |
+| --- | --- | --- | --- |
+| Longer **look-back window** (more history) | `MONTHS_BACK` | `6` | widen as needed (12/18/24); more history = more fetching, roughly linear in time |
+| Stricter / looser **churn cut-off** | `CHURN_DAYS` | `30` | a DAU-style definition can use `7` ("inactive for a week = churned"); `30` = MAU-style |
+| Forecast **further ahead** | `FORECAST_HORIZON_DAYS` + `FORECAST_HORIZONS` | `30` / `1,7,14,30,90` | e.g. add `180` for a half-year window; the main horizon joins the set automatically |
+| Bigger **sample** | `ADDRESS_LIMIT` | `200` | `2000` for the local validation; ~`12000` for the full run (needs the internal API) |
+| Different **chain** | `CHAIN_ID` | `1` (Ethereum) | Etherscan V2: `56`=BSC, `137`=Polygon, `42161`=Arbitrum |
+| **Force a re-run** after changing the above | `FORCE_PIPELINE=1` | `0` | `FORCE_PIPELINE=1 ./start.sh` |
+| Proxy for fetching (mandatory inside Docker) | `FETCH_PROXY` | empty | `http://host.docker.internal:7897` (`extra_hosts` is already set) |
+
+> ⏱️ **Time budget**: a free Etherscan key allows ≈5 req/s and each address hits 3 endpoints ⇒
+> roughly **0.6–1.2 s per address**: 2000 addresses ≈ 3–6 hours, 12000 ≈ 20–40 hours. For a
+> "runs for 24h / covers a longer span" outcome, put `scripts/daily_run.py` on a scheduler (see
+> "Daily scheduling & data-asset accumulation") and run **incrementally once a day** so
+> `daily_snapshots` accumulates — **a trend beats a single snapshot**.
 
 ---
 
@@ -275,8 +381,8 @@ server needed):
 
 ## 🔔 Alerting: e-mail + Lark card + macOS notification + run-status page
 
-Four outputs, built and dispatched by `src/notify.py` + `src/status_page.py` from **one shared
-source of truth**:
+Four outputs, built and dispatched by `src/deliver.py` (delivery scheduling) +
+`src/notify.py` + `src/status_page.py` from **one shared source of truth**:
 
 | Output | Content | Trigger |
 | --- | --- | --- |
@@ -291,6 +397,64 @@ source of truth**:
 > `msg_type: "post"` (rich text) can also bold but has no coloured header — hence the digest uses
 > a **card** while keeping a **plain-text fallback** (automatic downgrade if the card fails, see
 > `send_lark_digest()`).
+
+### 🧭 Three steps to light up all four channels
+
+#### 1️⃣ What to prepare on your own machine
+
+| What | Required? | Where to get it | Env key |
+| --- | --- | --- | --- |
+| Python 3.11 (manual run) or Docker Desktop (one-shot run) | ✅ | conda / docker.com | — |
+| **Etherscan API key** (V2, free) | ✅ (nothing gets fetched without it) | <https://etherscan.io/myapikey> | `ETHERSCAN_API_KEY` |
+| **E-mail** via a Gmail OAuth client (recommended) | for e-mail | Google Cloud Console → new project → **enable the Gmail API** → OAuth client (type: **Desktop app**) | `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` (`GMAIL_REFRESH_TOKEN` is written back for you) |
+| E-mail fallback: SMTP + app password | only if your account/network allows it | <https://myaccount.google.com/apppasswords> | `SMTP_USER` / `SMTP_PASS` |
+| **Lark group bot** | for the Lark card | group settings → Bots → add a custom bot → copy the webhook | `LARK_WEBHOOK_URL` |
+| Proxy (e.g. Clash `127.0.0.1:7897`) | recommended on mainland networks | your provider | `NET_PROXY` / `SMTP_PROXY` / `FETCH_PROXY` |
+
+> A partial setup is fine: a missing channel only logs one warning; the other three still land.
+
+#### 2️⃣ Two ways to configure it
+
+**① One command (recommended)**
+
+```bash
+cp environment.env.example environment.env   # fill in the table above (at least ETHERSCAN_API_KEY)
+./start.sh                                   # shows progress; auto-opens the status page + dashboard
+```
+
+**② Step by step (easier to debug, easier to verify one channel at a time)**
+
+```bash
+conda activate crypto_churn_prediction_project
+pip install -r requirements.txt
+cp environment.env.example environment.env
+
+# a) verify the two most fragile links first: e-mail and "can we open a browser?"
+python -m src.notify --enable-gmail-api   # one shot: consent → auto-enable Gmail API → send self-test
+python -m src.notify --open-test          # prove the system browser can be launched
+python -m src.notify --preview            # render only: e-mail HTML + Lark card JSON, nothing sent
+python -m src.notify --only-email         # retry the e-mail only (no Lark spam)
+
+# b) run the full pipeline and deliver all four channels
+python scripts/run_pipeline.py --deliver
+# or re-send only, reusing the existing prediction (no re-fetch)
+python scripts/daily_run.py --deliver-only
+```
+
+#### 3️⃣ The four channel links (auto-opened; copy them if that fails)
+
+| Channel | Link / entry point | Auto-opened? | If it does not open |
+| --- | --- | --- | --- |
+| ① Run-status page | `file:///absolute/path/to/reports/status.html` | ✅ after delivery (host side) | paste the `file://` link into the address bar |
+| ② Interactive dashboard | <http://localhost:8501> | ✅ when `./start.sh` finishes | open `http://localhost:8501` manually |
+| ③ E-mail | your inbox (`ALERT_EMAIL_TO`) | — (nothing to open) | check spam first; when the log says `email=False`, follow the 403 hint it prints |
+| ④ Lark card | the bot's group | — (the message is delivered) | re-send with `python -m src.notify` |
+| ⑤ Daily report HTML | `file:///.../reports/daily_report_YYYYMMDD.html` | no | click through from the status page, or double-click the file |
+
+> **How auto-opening works**: on macOS we try `/usr/bin/open` first (LaunchServices — it does
+> **not** need the "Automation" permission), then `open -a "Google Chrome"`, and only then
+> Python's `webbrowser` (osascript). Every attempt prints **which strategy actually worked**; if
+> all fail it prints the copy-pasteable link. Self-check: `python -m src.notify --open-test`.
 
 The card is built by `build_digest_card()`, the plain text by `build_digest_text()`. Real sample
 (`python -m src.notify --preview` or `python -m src.notify`) — the production copy is in Chinese
@@ -363,7 +527,8 @@ LARK_AT_ID=ou_xxxxxxxxxxxxxxxx
 # —— E-mail plan A (recommended): Gmail API + OAuth2 ——
 GMAIL_CLIENT_ID=xxxx.apps.googleusercontent.com
 GMAIL_CLIENT_SECRET=xxxx
-GMAIL_REFRESH_TOKEN=        # produced by: python -m src.notify --oauth-login
+GMAIL_REFRESH_TOKEN=        # written back by: python -m src.notify --enable-gmail-api
+                            # (that single command: consent → enable Gmail API → send self-test)
 
 # —— E-mail plan B: SMTP + app password (only if the account still allows it) ——
 SMTP_HOST=smtp.gmail.com
@@ -372,10 +537,14 @@ SMTP_USER=you@gmail.com
 SMTP_PASS=your_gmail_app_password
 ALERT_EMAIL_TO=you@gmail.com
 
-# Outbound proxy (shared by e-mail / Google API): Google domains are often
-# TLS-filtered in CN networks, so point this at a local proxy.
+# Outbound proxy (shared by e-mail / Google API / Etherscan fetch):
+# NET_PROXY + SMTP_PROXY cover e-mail and Google APIs; FETCH_PROXY covers the
+# Etherscan fetch. Set FETCH_PROXY only and e-mail/Google inherit it; set it to
+# `direct` and all three bypass the proxy. Locally an empty FETCH_PROXY still works
+# (requests picks up the macOS system proxy) but containers have no system proxy.
 NET_PROXY=http://127.0.0.1:7897
 SMTP_PROXY=http://127.0.0.1:7897
+FETCH_PROXY=http://127.0.0.1:7897   # inside Docker use http://host.docker.internal:7897
 
 ALERT_CHURN_RATE_THRESHOLD=0.40
 ALERT_RISK_CLUSTER_RATIO=0.25
@@ -393,29 +562,72 @@ ETHERSCAN_BASE_URL=https://api.etherscan.io/v2/api
 GMAIL_API_SEND_URL=https://gmail.googleapis.com/gmail/v1/users/me/messages/send
 ```
 
-> ⚠️ **Four pitfalls we actually hit** (see [docs/development-log.md](docs/development-log.md)):
+> ⚠️ **Pitfalls we actually hit** (debugging narrative in [docs/development-log.md](docs/development-log.md)):
 > 1. **Google is retiring "app passwords"** (<https://myaccount.google.com/apppasswords>), which
 >    is why this project supports **Gmail API + OAuth2** (port 443, easier to get through than
 >    SMTP:465). Note: a Google Cloud **API key (`AIza...`) cannot send mail** — it only
 >    identifies the project, not a user. Sending needs an **OAuth client ID + secret** (type:
 >    Desktop app) plus a refresh token from a one-off consent:
->    `python -m src.notify --oauth-login` walks you through it.
+>    `python -m src.notify --oauth-login` walks you through it, and
+>    `python -m src.notify --enable-gmail-api` goes further: one consent enables the Gmail API
+>    and sends a self-test e-mail.
 > 2. Using the account password for `SMTP_PASS` yields `535 BadCredentials`, and Gmail drops the
 >    connection right after the first rejection.
 > 3. In CN networks `smtp.gmail.com` often **connects at TCP level but hangs on the TLS
->    handshake** (`openssl s_client` shows no response) — set `NET_PROXY` / `SMTP_PROXY`
->    (e.g. Clash's `http://127.0.0.1:7897`) to tunnel through the proxy.
+>    handshake** — measured on this machine: 465 and 587, proxy **and** direct, all four timed
+>    out, i.e. **SMTP is unusable here and the Gmail API is the way out**. If your line allows
+>    it, set `NET_PROXY` / `SMTP_PROXY` (e.g. Clash's `http://127.0.0.1:7897`) to tunnel.
 > 4. `smtplib` **automatically retries with LOGIN after AUTH PLAIN fails**, masking the real
 >    `535` as "Connection unexpectedly closed"; this project pins `AUTH PLAIN` so errors stay
 >    readable.
+> 5. **The OAuth consent used to dead-end on the callback**: the browser bounced to
+>    `http://localhost:8765/?code=...` and showed `ERR_CONNECTION_REFUSED`. Two real causes are
+>    fixed: (a) on macOS Chrome resolves `localhost` to `::1` while the server only bound
+>    `127.0.0.1`; (b) the old code served exactly **one** connection via `handle_request()`, so a
+>    browser prefetch of `/favicon.ico` swallowed the callback. The callback server now listens
+>    **dual-stack (IPv4 + IPv6)**, keeps serving until a real `code` arrives, and writes
+>    `GMAIL_REFRESH_TOKEN` back into `environment.env`. Two escape hatches:
+>    `python -m src.notify --oauth-manual` (paste the full redirect URL back into the terminal)
+>    and `python -m src.notify --oauth-exchange "<URL or code>"` (redeem a code you already have).
+> 6. **`403: Gmail API has not been used in project … or it is disabled`** — the OAuth grant is
+>    fine; the API itself is switched off in the Cloud project. The log prints the exact console
+>    enable link, and `python -m src.notify --enable-gmail-api` self-heals it (re-consent with
+>    the `cloud-platform` scope → call the Service Usage API → poll until live → send a test).
+> 7. **The browser never popped up**: on macOS Python's `webbrowser` uses `osascript` (the
+>    "Automation" permission) and fails **silently** when that is not granted. We now try
+>    `/usr/bin/open` (LaunchServices) → `open -a "Google Chrome"` → `webbrowser`, and log which
+>    strategy won. Self-check: `python -m src.notify --open-test`.
 
-Manual verification of the four outputs (uses the latest real results, no network send):
+Manual verification of the four outputs (uses the latest real results):
 
 ```bash
 python -m src.notify --preview   # render only: reports/email_preview.html + reports/lark_card.json + print digest
 python -m src.notify             # real send: e-mail + Lark card (needs OAuth / webhook)
+python -m src.notify --only-email     # retry the e-mail only (keeps Lark quiet)
+python -m src.notify --open-test      # prove the system browser can be launched
+python -m src.notify --enable-gmail-api   # consent + enable Gmail API + e-mail self-test
 python -m src.status_page        # build reports/status.html and print its path
-python -m src.notify --oauth-login   # one-off Google consent, prints GMAIL_REFRESH_TOKEN
+python -m src.deliver --no-send --no-open   # walk all four outputs without really sending (self-check)
+python -m src.deliver --simulate-failure "simulated: Etherscan 429"   # verify the failure status page
+python -m src.notify --oauth-login    # one-off Google consent: writes GMAIL_REFRESH_TOKEN back to env
+python -m src.notify --oauth-manual   # use when the browser cannot reach localhost:8765
+```
+
+Egress routing for the fetch is explicit too (a configured proxy is tried first; the client falls
+back to a direct connection once the whole proxy retry chain fails):
+
+```bash
+FETCH_PROXY=http://127.0.0.1:7897 python -m src.data_fetcher --limit 5   # 5 addresses via proxy
+FETCH_PROXY=direct python -m src.data_fetcher --limit 5                 # force direct (triage)
+```
+
+The same chain, self-checked from the container/compose side:
+
+```bash
+# exercise the "reuse existing results, re-send all four outputs" branch
+docker compose exec churn-app python scripts/daily_run.py --deliver-only --no-open
+# just prove every output can be generated, with no network call
+docker compose exec churn-app python -m src.deliver --no-send --no-open
 ```
 
 ---
@@ -436,7 +648,13 @@ docker push bonnie333333333/crypto-churn-prediction:latest
 
 Key points in `docker-compose.yml`: Streamlit on port **8501**; `env_file` reads
 `environment.env` (optional — it still starts without one); `./data` and `./reports` are
-bind-mounted for persistence; a `healthcheck` probes `/_stcore/health`.
+bind-mounted for persistence (**this is how `status.html` reaches the host**); a `healthcheck`
+probes `/_stcore/health`; `RUN_DELIVER=1` decides whether first boot / a re-send delivers the
+four outputs; `CHURN_HEADLESS=1` tells the delivery layer "no GUI in here — do not fire a
+notification, do not open a browser".
+
+> Note: recipient addresses / Lark webhook belong in `environment.env` **only**. Do not put
+> them under `docker-compose.yml` `environment:` — that would override what `env_file` injected.
 
 > **Build tips (Apple Silicon / linux-arm64)**: the image is based on `python:3.11-slim`; since
 > arm64 has no pre-built `hdbscan` wheel, the Dockerfile pre-installs
@@ -485,7 +703,7 @@ bind-mounted for persistence; a `healthcheck` probes `/_stcore/health`.
 | Storage | SQLite (`whale_transfers`, …) | SQLite (`raw_transactions` / `address_features` / `address_clusters` / `churn_*`, …) |
 | Alerting | Terminal output + macOS notification | **HTML e-mail + Lark interactive card + macOS notification (click opens the status page)** with threshold/risk logic |
 | Scheduling | Scan new blocks daily | Daily 15:30 full pipeline + data-asset snapshots |
-| Delivery | Docker Compose (checker + Grafana) | Single image (pipeline + Streamlit), `start.sh` opens the browser |
+| Delivery | Docker Compose (checker + Grafana) | Single image (pipeline + four-output delivery + Streamlit); `start.sh` opens dashboard + status page |
 | Port | 3000 / 3001 | 8501 |
 
 ---

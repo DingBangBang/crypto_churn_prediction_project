@@ -19,7 +19,7 @@ ARIMA 多时间窗频次预测 → Streamlit 16 面板看板，并支持**定时
 - **可视化**：Streamlit + Plotly（16 panels）
 - **推送**：HTML 邮件 · **Lark 交互卡片（真加粗 + 彩色标题）** · macOS 通知（**点击直达运行状态页**）
 - **运行状态页**：`reports/status.html`（三方向入口 + 结果内容 + 报错详情，本地双击即可看）
-- **交付**：Docker 单镜像，`docker compose up` 一键跑全流程并开看板
+- **交付**：Docker 单镜像；`docker compose up`（或 `./start.sh`）一键 = 跑全流程 + **顺手交付四个去向**（邮件/Lark/状态页/快照）+ 开看板
 
 > ⚠️ **关于样本量（重要）**：过去 24h 的活跃节点约 **12000** 个，**本机跑不动**
 > （免费 Etherscan Key 限流约 5 请求/秒，2000 个地址即需数小时）。因此本项目**默认只取 2000 个
@@ -27,6 +27,44 @@ ARIMA 多时间窗频次预测 → Streamlit 16 面板看板，并支持**定时
 > 邮件/Lark/看板 三通道端到端能跑通。公司内部 Etherscan API（或自建归档节点）就绪后，
 > 把 `ADDRESS_LIMIT` 调到 `12000`、放宽 `MONTHS_BACK` 即可在**同一套代码**上跑全量。
 
+
+## 🎯 结果口径：这个项目到底在算什么
+
+> 看结果之前先看「尺子」。下面这张表就是本项目的度量衡 —— **换任何一个口径，结论都要重算**。
+
+| 口径维度 | 本项目设定 | 配置项 | 具体含义 |
+| --- | --- | --- | --- |
+| **时间窗（回看）** | 近 **6 个月** | `MONTHS_BACK=6` | 只统计 `now-6M` 之后的链上交易，更早的交易不进特征 |
+| **流失定义** | **30 天无任何交易** | `CHURN_DAYS=30` | `last_tx_days_ago > 30` ⇒ 标记为「已流失」（监督学习的标签口径） |
+| **预测窗口** | 主窗 30 天 + 1/7/14/30/90 天多窗 | `FORECAST_HORIZON_DAYS=30`、`FORECAST_HORIZONS=1,7,14,30,90` | 一次 ARIMA 拟合同时给出各窗口的**人均日频次**与**累计流失率** |
+| **链 / 币种** | 以太坊主网（`CHAIN_ID=1`），以 **ETH + ERC-20 代币**计量 | `CHAIN_ID`、`ETHERSCAN_API_BASE_URL` | Etherscan V2 支持多链，改 `CHAIN_ID` 即可切 BSC / Polygon / Arbitrum… |
+| **用户人群** | 10 个高活跃**种子地址**（交易所热钱包 / 巨鲸 / 基础设施）→ BFS 扩展其**交易对手方** → 取前 `ADDRESS_LIMIT` 个 | `ADDRESS_LIMIT=2000`、`SEED_ADDRESSES` | 本轮 = **2000** 个地址；不是全网用户，而是「以种子为中心的活跃子网」 |
+| **产品线 / 交易类型** | 普通转账 `txlist` + 内部调用 `txlistinternal` + **ERC-20 transfer** `tokentx` | 抓取阶段固定三类 | 不含 NFT / 合约内部事件 / 跨链桥跨链量（需额外 endpoint） |
+| **风险口径** | 高危簇占比 + 风险等级倍数分档 | `ALERT_RISK_CLUSTER_RATIO=0.25`、`RISK_*_MULTIPLIER` | 高危簇＝被聚成「高频套利者 / 噪音·机器人」的地址；等级＝预测流失率 ÷ 阈值的倍数（0.75/1.0/1.5×） |
+
+**这些数字意味着什么（单次运行）**
+
+| 输出 | 含义 | 怎么用 |
+| --- | --- | --- |
+| 预测流失率 18.0%（30 天） | 这批 2000 个活跃地址里，模型预测未来 30 天约 18% 会从「活跃」变「沉默」 | 召回活动的规模预算（触达上限 ≈ 18% × 活跃用户数） |
+| 高危地址占比 32.1% | 约 1/3 地址属于「高频套利者 / 噪音·机器人」这类高流失簇 | 风控/女巫识别优先，别把留存预算花在刷量地址上 |
+| 1940 个地址 → 34 个簇 | 人群画像的分层结构（persona + 占比 + 雷达图） | 分群运营：大户守住、噪音清理、DeFi 农民加权益 |
+| SHAP Top 特征 | 「为什么会流失」的可解释归因（如 `token_tx_ratio`、`eth_balance_end`） | 定召回话术与触达渠道 |
+| 1/7/14/30/90 天多窗 | 短窗 vs 长窗的**加速 / 减速**信号 | 短窗 > 长窗 = 加速出逃，需要立刻止血 |
+
+**这些数字意味着什么（数据资产化，长期）**
+
+- 每次运行都把当日结果写进 `daily_snapshots` 表，并保留 `reports/last_run.json`；
+- 累积 N 天后即可做**留存曲线 / 流失率趋势 / 模型回测**（同一口径横向对比）——
+  这就是「数据资产化」：**单次运行给结论，长期运行给趋势**；
+- 定时任务 `scripts/daily_run.py`（见下文「每日调度」）就是资产化的采集器。
+
+**必须知道的边界（别误读）**
+
+1. **样本量**：默认 / 本轮 2000 个地址，是**链路可行性验证**而非全网（全量约 12000 个活跃节点，需内部 API 或归档节点）；
+2. **限流**：免费 Etherscan Key ≈ 5 req/s，2000 个地址要数小时 —— 想要更长时间窗 / 更大样本，先看下文「想要 24h 或更长时间窗的结果」；
+3. **口径自定**：「活跃 / 流失 / 高危」是可配置的工程口径，与公司内部口径不同，落地前必须对齐；
+4. **粒度**：地址级（address-level），不做自然人 / 机构实体归并（需要额外的实体解析）。
 
 ---
 
@@ -74,11 +112,12 @@ crypto_churn_prediction_project/
 │   ├── cluster_analyzer.py  # ③ 聚类
 │   ├── churn_model.py       # ④ 流失预测 + SHAP + ARIMA（1/7/14/30/90 天多窗口）
 │   ├── notify.py            # 邮件 / Lark 卡片 / macOS 告警 + 简报/建议生成
+│   ├── deliver.py           # 四个去向的统一交付（本机 daily_run 与容器 --deliver 共用）
 │   └── status_page.py       # 运行状态页 reports/status.html（通知点击直达）
 ├── app/dashboard.py         # ⑤ Streamlit 16 面板
 ├── scripts/
-│   ├── run_pipeline.py      # 一键串起 ①→④
-│   └── daily_run.py         # 每日 15:30 调度 + 快照 + 告警 + 状态页
+│   ├── run_pipeline.py      # 一键串起 ①→④（容器首启加 --deliver 交付四去向）
+│   └── daily_run.py         # 每日 15:30 调度 / 四去向 / 快照（--deliver-only 可只交付）
 ├── templates/alert_email.html  # 预警邮件 HTML（{{占位符}}）
 ├── reports/                 # 产物：图表 / HTML 日报 / status.html / email_preview.html / lark_card.json
 ├── docs/
@@ -110,23 +149,66 @@ docker run -d --name crypto-churn-app -p 8501:8501 \
 # 打开 http://localhost:8501
 ```
 
-### 方式 B：`docker compose up` 一句命令拉起（推荐，自动跑脚本 + 自动开网页）
+### 方式 B：一句命令拉起（推荐）：`./start.sh`
 
 ```bash
 # 1) 准备环境变量
 cp environment.env.example environment.env
 #    编辑 environment.env：填入 ETHERSCAN_API_KEY（可选 ADDRESS_LIMIT / 邮件 / Lark）
 
-# 2) 一键：构建镜像 -> 首启自动跑完整流水线 -> 启动看板 -> 自动打开浏览器
+# 2) 一键：构建镜像 -> 首启跑完整流水线 -> 交付四个去向 -> 起看板 -> 自动打开页面
 ./start.sh
-#    等价于： docker compose up -d --build  然后  open http://localhost:8501
+#    等价于：docker compose up -d --build（带进度） + 自动打开
+#            http://localhost:8501（看板） 与 ./reports/status.html（运行状态页）
 ```
 
+**进度是「看得见」的**（不会闷声在后台跑）：
+
+```
+============================================================
+ 🪙 加密货币用户行为聚类分析与流失预测 · 流水线
+步骤：① 抓取链上交易 → ② 特征工程 → ③ 行为聚类 → ④ 流失预测 → ⑤ 交付四去向
+============================================================
+[1/5] ▶ 抓取链上交易（Etherscan） …
+已抓取 1240/2000 地址 [█████████████░░░░░░░░░░░]  62% 1240/2000 抓取地址 | 新增 715382 条 | 队列 813 | 用时 9432s
+✅ [1/5] 抓取链上交易（Etherscan）完成（23401.2s，总耗时 23401s）
+[2/5] ▶ 特征工程（六大类特征） …
+```
+
+- `./start.sh` 会把**容器日志实时流到你的终端**（阶段编号 + 进度条 + 百分比），跑完自动打开状态页与看板；
+- 或者前台跑（日志天然可见）：`docker compose up --build`；
+- 后台跑也可以随时看：`docker compose logs -f churn-app`。
+
 `docker-entrypoint.sh` 会在**首次启动**时自动按顺序执行：
-`data_fetcher → feature_engineer → cluster_analyzer → churn_model → streamlit run app/dashboard.py`，
-跑完整合到容器内数据库。之后重启会直接启动看板（用 marker 判断，`FORCE_PIPELINE=1` 可强制重跑）。
+
+```
+data_fetcher → feature_engineer → cluster_analyzer → churn_model
+        → --deliver（邮件 + Lark 卡片 + reports/status.html 运行状态页 + 快照/last_run.json）
+        → streamlit run app/dashboard.py
+```
+
+之后重启会直接启动看板（用 marker 判断，`FORCE_PIPELINE=1` 可强制重跑）；若此时想**补发**
+四去向，容器会用 `scripts/daily_run.py --deliver-only` 复用已有的 `churn_summary.json`
+重发一遍（不会重跑阶段、不会重复抓取）。
+
+**关键点：容器与 compose 只负责「生成 + 推送」，不负责「弹通知 / 开页面」**
+
+| 动作 | 谁做 | 说明 |
+| --- | --- | --- |
+| 邮件 / Lark 卡片 / 状态页生成 | **容器内**（`run_pipeline.py --deliver`） | 与本机 `daily_run.py` 共用 `src/deliver.py`，**同一口径** |
+| 状态页落盘 | 容器写 `/app/reports/status.html` → 挂载到宿主机 `./reports/status.html` | 宿主机双击即可看 |
+| macOS 通知 | **宿主机**（`start.sh` 结束后 / `daily_run.py`） | 容器无 GUI，`CHURN_HEADLESS=1` 时交付层只记一行日志 |
+| 打开看板 / 打开状态页 | **宿主机**（`start.sh`） | 容器里 `open`/`webbrowser` 无效 |
+
+- 只想要数据、不想推送：`RUN_DELIVER=0 ./start.sh`
+- 不想自动开浏览器（CI / 远程终端）：`NO_OPEN=1 ./start.sh`
+- 想要 2000 个地址的全量验证：`ADDRESS_LIMIT=2000 ./start.sh`
+- 容器内若想手动补发一次：`docker compose exec churn-app python scripts/daily_run.py --deliver-only`
+- 停止：`docker compose down`（数据留在 `./data`、报告留在 `./reports`）
 
 > 浏览器：打开 <http://localhost:8501> 即直接看到看板（Streamlit 无需登录）。
+> 如果 `./start.sh` 结束时代浏览器没有自动弹出，它会打印**实际使用的打开方式**与
+> `file://` / `http://` 链接，复制即可访问；自检命令：`python -m src.notify --open-test`。
 
 ### 方式 C：手动一步步依次跑脚本（本地 conda，便于调试）
 
@@ -159,6 +241,25 @@ python scripts/daily_run.py --dry-run   # 模拟每日任务（不联网抓取�
 > 后缀（如 `data/crypto_churn_test.db`、`reports/cluster_pie_test.png`），避免污染全量数据集。
 > 本机验证规模为 `2000`（免费 Etherscan Key 限流下约需数小时）；**全量约 12000 个节点**
 > 需公司内部 Etherscan API / 归档节点，把 `ADDRESS_LIMIT` 改为 `12000` 即可。
+
+### 🔧 想要 24h / 更长窗口 / 更大样本的结果：改 `environment.env`
+
+所有「口径」都集中在 **`environment.env`**（模板见 `environment.env.example`）：
+
+| 想要的效果 | 改哪个键 | 默认 | 建议值 / 说明 |
+| --- | --- | --- | --- |
+| 更长的**回看窗口**（更久的历史行为） | `MONTHS_BACK` | `6` | 要覆盖「24h 活跃」这类更长的观察期就按需拉长（12/18/24）；历史越长，抓取量越大、耗时线性增长 |
+| 「流失」判定更严格 / 更宽松 | `CHURN_DAYS` | `30` | 日活口径可设 `7`（一周不活跃即算流失）；`30` = 月活口径 |
+| 预测**更远的未来** | `FORECAST_HORIZON_DAYS` + `FORECAST_HORIZONS` | `30` / `1,7,14,30,90` | 例如加 `180` 做半年窗；主窗会自动并入集合 |
+| 扩大**样本量** | `ADDRESS_LIMIT` | `200` | 本机验证用 `2000`；全量约 `12000`（需内部 API / 归档节点） |
+| 切换**链** | `CHAIN_ID` | `1`（以太坊） | Etherscan V2 多链：`56`=BSC、`137`=Polygon、`42161`=Arbitrum |
+| 改完口径后**强制重跑** | `FORCE_PIPELINE=1` | `0` | `FORCE_PIPELINE=1 ./start.sh` |
+| 抓取走代理（容器内必须显式给值） | `FETCH_PROXY` | 空 | `http://host.docker.internal:7897`（compose 已加 `extra_hosts`） |
+
+> ⏱️ **耗时预期**：免费 Etherscan Key ≈ 5 req/s，每个地址 3 个 endpoint ⇒ 约 **0.6~1.2 秒/地址**；
+> 2000 个地址 ≈ 3~6 小时，12000 个 ≈ 20~40 小时。想要「24h 常驻 / 更长时间跨度」的结果，
+> 就把 `scripts/daily_run.py` 挂到定时任务（见下节「每日调度与数据资产化」），**每天增量跑一次**，
+> 让 `daily_snapshots` 连续累积 —— **趋势比单次快照更有价值**。
 
 ---
 
@@ -247,11 +348,17 @@ cd ~/Desktop/crypto_churn_prediction_project && \
 > application` 而不会在设置里列出它。若未授权，代码会**自动回退**到 `osascript` 普通横幅
 > （并在日志里给出上述开启提示），且状态页仍会被自动打开，功能不丢。
 
+> **Docker / compose 下这一页怎么来？** 容器首启会跑
+> `run_pipeline.py --deliver`（或补发时 `daily_run.py --deliver-only`），把状态页写进
+> 挂载目录 → 宿主机 `./reports/status.html`；**通知与「打开页面」由宿主机 `./start.sh`
+> 负责**（容器无 GUI）。详见 [方式 B](#方式-bdocker-compose-up-一句命令拉起推荐自动跑脚本--自动开网页)。
+
 ---
 
 ## 🔔 预警推送：邮件 + Lark 卡片 + macOS 通知 + 运行状态页
 
-四个出口由 `src/notify.py` + `src/status_page.py` 统一构建、分发，**内容同源、口径一致**：
+四个出口由 `src/deliver.py`（交付调度）+ `src/notify.py` + `src/status_page.py`
+统一构建、分发，**内容同源、口径一致**：
 
 | 出口 | 推送内容 | 触发条件 |
 | --- | --- | --- |
@@ -264,6 +371,63 @@ cd ~/Desktop/crypto_churn_prediction_project && \
 > （消息卡片），卡片内文本用 `lark_md` 方言即可获得**真加粗**、彩色标题栏、分割线、超链接与 @；
 > `msg_type: "post"`（富文本）也能加粗但没有彩色标题栏。因此简报用**卡片**发送，同时保留一段
 > **纯文本兜底**（卡片发送失败时自动降级，见 `send_lark_digest()`）。
+
+### 🧭 三步配好四个去向（照着做就行）
+
+#### 1️⃣ 本地要提前准备好的东西
+
+| 需要什么 | 必需？ | 在哪拿 | 填到哪 |
+| --- | --- | --- | --- |
+| Python 3.11（手动跑）或 Docker Desktop（一键跑） | ✅ | conda / docker.com | — |
+| **Etherscan API Key**（V2，免费） | ✅（不填则不抓数，只能看已有 DB） | <https://etherscan.io/myapikey> | `ETHERSCAN_API_KEY` |
+| **邮件**：Gmail OAuth 客户端（推荐） | 想要邮件就要 | Google Cloud Console → 新建项目 → **启用 Gmail API** → OAuth 客户端（类型：**桌面应用**） | `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET`（`GMAIL_REFRESH_TOKEN` 由 `--enable-gmail-api` 自动写回） |
+| 邮件备选：SMTP + 应用专用密码 | 部分网络/账号可用 | <https://myaccount.google.com/apppasswords> | `SMTP_USER` / `SMTP_PASS` |
+| **Lark 群机器人** | 想要 Lark 卡片就要 | 群设置 → 群机器人 → 添加「自定义机器人」→ 复制 Webhook | `LARK_WEBHOOK_URL` |
+| 代理（如 Clash `127.0.0.1:7897`） | 国内网络建议 | 你的机场 / 自建 | `NET_PROXY` / `SMTP_PROXY` / `FETCH_PROXY` |
+
+> 只填一部分也能跑：缺哪个通道，交付层只**记一行警告**，其余通道照常出结果。
+
+#### 2️⃣ 两种配置方式
+
+**① 一键（推荐）**
+
+```bash
+cp environment.env.example environment.env   # 填上表里的值（至少 ETHERSCAN_API_KEY）
+./start.sh                                   # 带进度；跑完自动打开状态页 + 看板
+```
+
+**② 手动逐步（便于调试、分步验证）**
+
+```bash
+conda activate crypto_churn_prediction_project
+pip install -r requirements.txt
+cp environment.env.example environment.env
+
+# a) 先单独验证「邮件 + 浏览器唤起」两条最容易出问题的链路
+python -m src.notify --enable-gmail-api   # 一次性：授权 → 自动启用 Gmail API → 发信自检
+python -m src.notify --open-test          # 验证「能不能自动唤起系统浏览器」
+python -m src.notify --preview            # 不发送：只渲染邮件 HTML / Lark 卡片 JSON
+python -m src.notify --only-email         # 只重试发邮件（不打扰 Lark）
+
+# b) 跑完整流水线 + 交付四个去向
+python scripts/run_pipeline.py --deliver
+# 或复用已有预测结果只重发一遍（不重抓数据）
+python scripts/daily_run.py --deliver-only
+```
+
+#### 3️⃣ 四个去向的链接 / 入口（会自动唤起；失败请手动访问）
+
+| 去向 | 链接 / 入口 | 会自动唤起吗？ | 唤起失败怎么办 |
+| --- | --- | --- | --- |
+| ① 运行状态页 | `file:///你的项目绝对路径/reports/status.html` | ✅ 交付完成后自动打开（宿主机） | 把这条 `file://` 链接复制到浏览器地址栏 |
+| ② 交互看板 | <http://localhost:8501> | ✅ `./start.sh` 结束时自动打开 | 手动访问 `http://localhost:8501` |
+| ③ 邮件 | 收件箱（`ALERT_EMAIL_TO`） | —（邮件无需打开） | 先看垃圾邮件；日志 `email=False` 时按其 403 提示处理 |
+| ④ Lark 卡片 | 机器人所在群 | —（消息直达群里） | `python -m src.notify` 重发卡片 |
+| ⑤ 当日日报 HTML | `file:///.../reports/daily_report_YYYYMMDD.html` | 不自动开 | 从状态页点进去，或直接双击文件 |
+
+> **自动打开是怎么做的**：macOS 上优先用 `/usr/bin/open`（LaunchServices，不依赖「自动化」授权），
+> 失败再退 `open -a "Google Chrome"`，最后才用 Python `webbrowser`（osascript）；每次都打印
+> **实际命中的方式**，全失败则打印可手动访问的链接。自检：`python -m src.notify --open-test`。
 
 Lark 卡片由 `build_digest_card()` 生成、纯文本由 `build_digest_text()` 生成，实测样例
 （`python -m src.notify --preview` 或 `python -m src.notify`）：
@@ -358,7 +522,8 @@ LARK_AT_ID=ou_xxxxxxxxxxxxxxxx
 # —— 邮件方案 A（推荐）：Gmail API + OAuth2 ——
 GMAIL_CLIENT_ID=xxxx.apps.googleusercontent.com
 GMAIL_CLIENT_SECRET=xxxx
-GMAIL_REFRESH_TOKEN=        # 执行 python -m src.notify --oauth-login 自动获得
+GMAIL_REFRESH_TOKEN=        # 由 python -m src.notify --enable-gmail-api 自动写回
+                            # （该命令同时会：授权 → 自动启用 Gmail API → 发信自检）
 
 # —— 邮件方案 B：SMTP + 应用专用密码（仅在账号仍可用时）——
 SMTP_HOST=smtp.gmail.com
@@ -367,9 +532,14 @@ SMTP_USER=dingbangchu@gmail.com
 SMTP_PASS=你的Gmail应用专用密码
 ALERT_EMAIL_TO=dingbangchu@gmail.com
 
-# 出站代理（邮件 / Google API 通用）：国内网络对 Google 系域名常做 TLS 层阻断
+# 出站代理（邮件 / Google API / Etherscan 抓取）：
+# NET_PROXY / SMTP_PROXY 供邮件与 Google API 用；FETCH_PROXY 供 Etherscan 抓取用
+# （只填 FETCH_PROXY 时邮件/Google API 会自动复用它；抓取填 direct 则三者都不走代理）
+# 探测端口/线路是否通：FETCH_PROXY=direct python -m src.data_fetcher --limit 5
+# （不填也能用 —— 本地 requests 会自动读系统代理；容器里没有系统代理，必须填）
 NET_PROXY=http://127.0.0.1:7897
 SMTP_PROXY=http://127.0.0.1:7897
+FETCH_PROXY=http://127.0.0.1:7897      # 容器里请改成 http://host.docker.internal:7897
 
 ALERT_CHURN_RATE_THRESHOLD=0.40
 ALERT_RISK_CLUSTER_RATIO=0.25
@@ -387,23 +557,50 @@ ETHERSCAN_BASE_URL=https://api.etherscan.io/v2/api
 GMAIL_API_SEND_URL=https://gmail.googleapis.com/gmail/v1/users/me/messages/send
 ```
 
-> ⚠️ **四个常见坑**（均已实测踩过，见 [docs/development-log.md](docs/development-log.md)）：
+> ⚠️ **常见坑**（均已实测踩过，排查过程见 [docs/development-log.md](docs/development-log.md)）：
 > 1. **Google 已逐步下线「应用专用密码」**（<https://myaccount.google.com/apppasswords>），
 >    因此本项目支持改用 **Gmail API + OAuth2**（走 443，比 SMTP:465 更易穿透）。
 >    ⚠️ 注意：Google Cloud 里的 **API Key（`AIza...`）不能用来发信** —— 它只标识项目、
 >    不代表用户身份；发信需要 **OAuth 客户端 ID + 客户端密钥**（类型：桌面应用）+
 >    一次性授权换来的 **refresh token**。`python -m src.notify --oauth-login` 会帮你走完授权。
+>    （`--enable-gmail-api` 更省事：授权同时把 Gmail API 一并启用并自检发信。）
 > 2. `SMTP_PASS` 用账号登录密码会收到 `535 BadCredentials`，且 Gmail 在首次拒绝后立即断连。
-> 3. 国内网络下 `smtp.gmail.com` 常常**TCP 能连但 TLS 握手挂死**（`openssl s_client` 无响应）。
->    填上 `NET_PROXY` / `SMTP_PROXY`（如 Clash 的 `http://127.0.0.1:7897`）走代理隧道即可。
+> 3. 国内网络下 `smtp.gmail.com` 常常**TCP 能连但 TLS 握手挂死**（实测 465/587、代理/直连
+>    四条路全部超时 ⇒ **SMTP 整条不可用时改用 Gmail API**）。若你的线路能过，就填
+>    `NET_PROXY` / `SMTP_PROXY`（如 Clash 的 `http://127.0.0.1:7897`）走代理隧道。
 > 4. `smtplib` 会在 AUTH **PLAIN 失败后自动改用 LOGIN 重试**，把真实的 `535` 掩盖成
 >    「Connection unexpectedly closed」；本项目已锁死 `AUTH PLAIN` 让报错保持可读。
+> 5. **OAuth 一次性授权曾卡在回调**：浏览器跳到 `http://localhost:8765/?code=...` 却
+>    `ERR_CONNECTION_REFUSED`。两个真实原因已修：① macOS 上 Chrome 把 `localhost` 解析成
+>    `::1`，而服务器只绑了 `127.0.0.1`；② 老实现用 `handle_request()` 只服务**一个**连接，
+>    浏览器预取 `/favicon.ico` 就把回调「吃掉」了。现在回调服务器 **IPv4/IPv6 双栈监听**
+>    + 循环服务 + 自动把 `GMAIL_REFRESH_TOKEN` 写回 `environment.env`。
+>    兜底两条：`python -m src.notify --oauth-manual`（把地址栏整条 URL 粘回终端）、
+>    `python -m src.notify --oauth-exchange "<URL或code>"`（兑换已经拿到的 code）。
+> 6. **`403: Gmail API has not been used in project … or it is disabled`** —— OAuth 授权是好的，
+>    只是 Gmail API 没在项目里启用。日志会直接给出 Cloud Console 启用链接；
+>    想一条命令自愈就用 `python -m src.notify --enable-gmail-api`
+>    （重新授权带上 `cloud-platform` → 代码调 Service Usage API 启用 → 轮询生效 → 发信自检）。
+> 7. **浏览器不弹窗**：macOS 上 Python `webbrowser` 走 `osascript`（需要「自动化」授权），
+>    未授权时会**静默失败**。本项目改为优先 `/usr/bin/open`（LaunchServices）→ `open -a Chrome`
+>    → `webbrowser` 兜底，并打印实际命中的方式；自检：`python -m src.notify --open-test`。
 
 手动测试推送（用**最近一次真实预测结果**，不是假数字）：
 
 ```bash
-python -m src.notify                # 发测试邮件 + Lark 简报（聚类结果 + 洞察）
-python -m src.notify --oauth-login  # 一次性 Google 授权，打印 GMAIL_REFRESH_TOKEN
+python -m src.notify                  # 发测试邮件 + Lark 简报（聚类结果 + 洞察）
+python -m src.notify --only-email     # 只重试发邮件（不打扰 Lark）
+python -m src.notify --open-test      # 验证「能不能自动唤起系统浏览器」
+python -m src.notify --enable-gmail-api  # 授权 + 自动启用 Gmail API + 发信自检
+python -m src.notify --oauth-login    # 只做一次性 Google 授权（自动写回 GMAIL_REFRESH_TOKEN）
+python -m src.notify --oauth-manual   # 若浏览器连不上 localhost:8765，用这个贴回 URL
+```
+
+抓取线路也可单独指定（配了代理时先走代理，整条重试链失败后**自动回落直连**）：
+
+```bash
+FETCH_PROXY=http://127.0.0.1:7897 python -m src.data_fetcher --limit 5   # 经代理抓 5 个地址
+FETCH_PROXY=direct python -m src.data_fetcher --limit 5                 # 强制直连（排障）
 ```
 
 
@@ -424,8 +621,13 @@ docker push bonnie333333333/crypto-churn-prediction:latest
 ```
 
 `docker-compose.yml` 关键点：Streamlit 端口 **8501**；`env_file` 读取
-`environment.env`（可选，未提供也能启动）；挂载 `./data` 与 `./reports` 持久化；
-`healthcheck` 探测 `/_stcore/health`。
+`environment.env`（可选，未提供也能启动）；挂载 `./data` 与 `./reports` 持久化
+（**状态页 `status.html` 就靠 `./reports` 这一步带到宿主机**）；`healthcheck` 探测
+`/_stcore/health`；`RUN_DELIVER=1` 决定首启/补发是否交付四去向；`CHURN_HEADLESS=1`
+告诉交付层「容器内没有 GUI，别弹通知也别开浏览器」。
+
+> 注意：邮件收件人 / Lark webhook 这类配置**只放 `environment.env`**，不要写进
+> `docker-compose.yml` 的 `environment:`（会覆盖 `env_file` 注入的值）。
 
 > **构建小贴士（Apple Silicon / linux-arm64）**：镜像基于 `python:3.11-slim`，
 > 由于 arm64 上没有 `hdbscan` 预编译 wheel，Dockerfile 里预装了 `gcc g++ python3-dev cython3`
@@ -491,7 +693,7 @@ docker push bonnie333333333/crypto-churn-prediction:latest
 | 存储 | SQLite（`whale_transfers` 等） | SQLite（`raw_transactions` / `address_features` / `address_clusters` / `churn_*` …） |
 | 告警 | 终端打印 + macOS 通知 | **HTML 邮件 + Lark 交互卡片 + macOS 通知（点击直达状态页）**（带阈值/风险等级判断） |
 | 调度 | 每日扫描新块 | 每日 15:30 全流程 + 数据资产快照累积 |
-| 交付 | Docker Compose（checker + Grafana） | 单镜像（流水线 + Streamlit），`start.sh` 自动开网页 |
+| 交付 | Docker Compose（checker + Grafana） | 单镜像（流水线 + 四去向交付 + Streamlit），`start.sh` 自动开看板 + 状态页 |
 | 端口 | 3000 / 3001 | 8501 |
 
 ---
@@ -509,7 +711,18 @@ docker push bonnie333333333/crypto-churn-prediction:latest
 python -m src.notify --preview   # 只渲染：reports/email_preview.html + reports/lark_card.json + 打印简报
 python -m src.notify             # 真发送：邮件 + Lark 卡片（需要 OAuth / webhook）
 python -m src.status_page        # 生成 reports/status.html 运行状态页并打印路径
+python -m src.deliver --no-send --no-open   # 四去向一起走一遍，但不真的发（自检，推荐）
+python -m src.deliver --simulate-failure "模拟：Etherscan 429"   # 验证「失败也要交付」的状态页
 python -m src.notify --oauth-login   # 一次性 Google 授权，打印 GMAIL_REFRESH_TOKEN
+```
+
+容器/compose 侧同一条链路的自检（不重建镜像，把新代码挂进去跑 entrypoint）：
+
+```bash
+# 触发「复用已有结果补发四去向」分支（等价于 docker compose 首启跑完后的补发）
+docker compose exec churn-app python scripts/daily_run.py --deliver-only --no-open
+# 只看四去向是否都能生成、不发网络请求
+docker compose exec churn-app python -m src.deliver --no-send --no-open
 ```
 
 ---

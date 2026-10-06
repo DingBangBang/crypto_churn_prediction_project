@@ -265,8 +265,238 @@
   上限内完成：`latest: digest sha256:8f1eed0b4b6b90402d5b9412e13ef625199e1d756f6571c4274875c26b84fd8d`。
 - 结论：**分层 + 续传 + 硬上限**是弱网下最实用的组合；公司内网直接推 Harbor 更省事。
 
-## 18. 待办 / 未来可优化点
+## 18. `docker compose` 到底封装了哪几步？—— 一次「名不副实」的排查与修复
 
+- **起因**：自查「compose 是否把邮件/Lark/状态页/通知四个去向 + 自动打开看板都封装了」。
+- **事实**：**没有全包**。当时的链路是
+  `docker-entrypoint.sh → scripts/run_pipeline.py`：只跑 ①→④ 四个阶段，末尾那句
+  `notify.send_alerts(...)` 只能算「阈值触发的邮件/Lark」，而**真正把四去向做全**的
+  `scripts/daily_run.py`（Lark 简报卡片、`reports/status.html`、`last_run.json`、
+  `daily_snapshots` 快照、macOS 通知、自动打开）**从未被 compose 调用**。
+  另外「自动打开浏览器」是宿主机 `start.sh` 的 `open`，与 compose 无关。
+- **根因**：交付逻辑写死在 `daily_run.py` 的 `main()` 里，脚本既管「跑」又管「送」，
+  于是「跑流水线的入口」和「送结果的入口」是两个不同的脚本，compose 只接了前者。
+- **修法**：把交付抽成 **`src/deliver.py`**（`deliver()` / `deliver_failure()` /
+  `load_forecast_summary()`），让两个入口共用同一份代码：
+  - `scripts/daily_run.py` → 精简为「跑流水线 + 调 deliver」，新增
+    `--deliver-only`（复用 `churn_summary.json`，**零重算**重发四去向）、`--no-send`、`--no-open`；
+  - `scripts/run_pipeline.py --deliver` → 容器首启用，直接把内存里的预测结果交给 deliver；
+  - `docker-entrypoint.sh` → 首启 `run_pipeline.py --deliver`；若已有特征数据则
+    `daily_run.py --deliver-only` 补发；`RUN_DELIVER=0` 可只跑流水线；
+  - `start.sh` → 宿主机负责「最后一步」：打开看板 **+** `./reports/status.html`。
+- **容器无 GUI 的处理**：`deliver.in_container()`（`/.dockerenv` 或 `CHURN_HEADLESS=1`）
+  让 `notify_desktop()` / `open_page()` 只记一行日志（`容器内无 GUI，跳过 macOS 通知；状态页在 …`），
+  不再白跑 `osascript`/`webbrowser`。
+- **验证方式（不重建镜像）**：`docker run` 现有镜像 + 把 `src/ scripts/ docker-entrypoint.sh`
+  挂进去，删掉 `data/.pipeline_done` 触发补发分支，得到：
+  `[entrypoint] 复用已有结果补发四去向：python scripts/daily_run.py --deliver-only` →
+  `运行状态页已生成 -> /app/reports/status.html` → `容器内无 GUI…` → 宿主机 `./reports/status.html`
+  同步更新（挂载卷），`reports/last_run.json` 为 `ok: true`；再加
+  `CHURN_HEADLESS=1` 的 `run_pipeline.py --skip-fetch --deliver --no-send --no-open` 复核同一链路。
+- **踩到的坑**：往 `docker-compose.yml` 的 `environment:` 里加 `ALERT_EMAIL_TO: "${ALERT_EMAIL_TO:-}"`
+  会**覆盖 `env_file` 注入的值**（compose 里 `environment` 优先级高于 `env_file`），
+  空字符串会把 `environment.env` 里的收件人抹掉 —— 收件人/webhook 一律只放 `environment.env`。
+- **一句话结论**：**入口可以有两个，「交付」只能有一份实现**；容器负责「生成+推送」，
+  宿主机负责「弹通知 + 开页面」。
+
+## 19. OAuth 一次性授权「浏览器 ERR_CONNECTION_REFUSED」+ 抓取加代理：两个真实卡点
+
+### 19.1 现象与根因：回调服务器没接住 Google 的 code
+
+- **现象**：`python -m src.notify --oauth-login` 打开浏览器，同意授权后跳到
+  `http://localhost:8765/?iss=https://accounts.google.com&code=4/0AXl...` —— 页面却是
+  `ERR_CONNECTION_REFUSED`（"localhost 拒绝了我们的连接请求"）。
+- **根因（两个，都在回调服务器这一小段代码里）**：
+  1. **只绑了 IPv4**：老实现 `HTTPServer((parsed.hostname or "localhost", port), Handler)`
+     里 `HTTPServer` 的 `address_family = AF_INET`，`localhost` 被解析成 `127.0.0.1`；
+     而 macOS 上的 Chrome/系统解析 `localhost` **优先 `::1`**，直接拒连。
+  2. **只服务一个连接**：`server.handle_request()` 收到**第一个**请求就返回并 `server_close()`。
+     浏览器（或系统/插件）常先探一个 `/favicon.ico` 之类 —— 那个杂包会把「唯一一次机会」用掉，
+     真正的回调到来时端口已经关了，于是又变成 `ERR_CONNECTION_REFUSED`。
+- **修法**（`src/notify.py`）：
+  - `_serve_callback()`：`ThreadingHTTPServer` 子类 + `address_family = AF_INET6` +
+    `IPV6_V6ONLY=0` → **双栈监听**（`127.0.0.1` 与 `::1` 同时可用）；无 IPv6 时自动退化为纯 IPv4；
+  - 处理函数里**只有**带 `code`/`error` 的请求才算回调，杂包一律 `204` 并继续等；
+  - `server.timeout = 1` + `while not captured and time.time() < deadline: handle_request()`
+    → 循环服务直到拿到 code 或超时；
+  - **先起服务器再开浏览器**（老代码顺序相反，存在「浏览器已跳回、端口还没监听」的竞态）。
+- **闭环补完**：拿到 code 后 `_finish_oauth()` 直接兑换，并把 `GMAIL_REFRESH_TOKEN=...`
+  **原地写回 `environment.env`**（`_persist_env_value()`，保留其它行、不重复追加），
+  `--no-write` 可关掉 —— 不用再手动复制粘贴。
+- **两条兜底**（这次事故催生的）：
+  - `python -m src.notify --oauth-manual`：不起服务器，把**地址栏里整条回调 URL** 粘回终端；
+  - `python -m src.notify --oauth-exchange "<URL 或 code>"`：兑换已经拿到的 code。
+    本次实测用户给的旧 code 已 `invalid_grant`（**授权码只能兑换一次、约 10 分钟有效**），
+    报错信息会明确提示「重新跑 `--oauth-login` / `--oauth-manual`」。
+- **验证**（本机实测）：先起 `--oauth-login`，`nc -z 127.0.0.1 8765` 与 `nc -z ::1 8765`
+  都通过；`GET /favicon.ico` → `204`（不吃回调）；`GET /?code=FAKE_CODE_FOR_TEST` → `200`
+  且进程立刻进入「兑换 token」分支（假 code 自然被 Google 拒），**全链路闭环打通**，
+  只剩人工点「允许」。回归测试：`test_oauth_callback_server_listens_on_ipv4_and_ipv6`
+  （parametrize 覆盖 `127.0.0.1` / `[::1]`）+ `test_parse_oauth_redirect_*` +
+  `test_oauth_persist_env_value_updates_in_place`。
+- **顺带**：Terminal Notifier 的「通知权限」已由用户在系统设置里授予，实测能收到横幅
+  （不再走 `osascript` 兜底）。
+
+### 19.2 抓取端：显式代理 + 代理失败自动回落直连
+
+- **背景**：2k 抓取跑到 1450/2000 时批量 `ConnectTimeoutError`（api.etherscan.io），
+  原因是本地 Clash/mihomo 恰好被切换/重启（代理端口 `127.0.0.1:7897` 一度不可用）。
+  线路恢复后抓取**自己接着跑完了**（写入是 `INSERT OR IGNORE`，天然幂等，无需从头再来）；
+  但暴露了一个真问题：**抓取这条链路没有显式代理配置，全靠 requests 隐式读系统代理**——
+  容器里没有系统代理，这条线一断就是干等。
+- **修法**：
+  - `src/config.py` 新增 `FETCH_PROXY`（优先级 `FETCH_PROXY` > 标准 `HTTPS_PROXY`/`HTTP_PROXY`
+    > `NET_PROXY`）、`normalize_proxy()`、`is_direct()`、`http_proxies()`；
+    特殊值 `direct|none|off` 表示**强制直连**（同时关掉 `Session.trust_env`，不再读系统代理）。
+  - `src/data_fetcher.py` 的 `EtherscanClient` 支持 `proxy=` 参数与 `--proxy` CLI：
+    配了代理就**先走代理**，整条重试链（`HTTP_RETRIES` 次）都失败后**自动切直连**，
+    并在日志里打印「抓取出口：…」「出口「代理 …」不可用，切换到下一条线路」。
+  - `docker-compose.yml` 加 `extra_hosts: host.docker.internal:host-gateway`，
+    容器要用宿主代理时在 `environment.env` 写 `FETCH_PROXY=http://host.docker.internal:7897`。
+- **验证**：① `FETCH_PROXY=http://127.0.0.1:7897` → `via = 代理 http://127.0.0.1:7897`；
+  ② `FETCH_PROXY=direct` → `proxies=None, trust_env=False, via = 直连`；
+  ③ 故意指向死代理 `127.0.0.1:9` → 日志出现「出口「代理 …」不可用，切换到下一条线路」并回落直连
+  （单测 `test_fetcher_falls_back_to_direct_when_proxy_is_down` 覆盖）。
+  单测还揪出一个真 bug：`direct` 先被 `normalize_proxy()` 拼成 `http://direct` 才判断哨兵值，
+  导致「强制直连」失效 —— 已修为先判 `is_direct()` 再补 scheme。
+- **环境判定（本次实测）**：`scutil --proxy` 显示 HTTP/HTTPS/SOCKS 均为 `127.0.0.1:7897`，
+  `nc -z` 通过，`api.etherscan.io`、`oauth2.googleapis.com` 经代理与直连都能打通（**当前无需改
+  Clash 模式**；只在代理进程重启的那几分钟里两条路都不通）。
+
+## 20. 2000 地址真实运行结果（链路可行性验证完成）
+
+**运行口径**：`ADDRESS_LIMIT=2000`、`CHAIN_ID=1`（以太坊主网）、`MONTHS_BACK=6`、
+`CHURN_DAYS=30`、`FORECAST_HORIZONS=1,7,14,30,90`，本机 conda 环境 + Clash `127.0.0.1:7897` 出口。
+
+| 指标 | 数值 |
+| --- | --- |
+| 抓取地址数 | **2000 / 2000**（`data/crypto_churn.db`） |
+| 新增交易记录 | **+1,153,806** 行（`INSERT OR IGNORE` 幂等 —— 中途断线重跑不产生重复数据） |
+| 进入聚类的地址 | **1940** 个 → **34 个簇** |
+| 预测流失率（30 天） | **18.0%** |
+| 高危地址占比 | **32.1%**（阈值 25%，属 🟡/🟠 区间） |
+| 四去向交付 | Lark 卡片 ✅ ｜ 运行状态页 ✅ ｜ macOS 通知 ✅ ｜ **邮件 ❌**（Gmail API 403，见 §21.3） |
+
+**这批数字的业务读法**
+
+- **18.0% / 30 天**：这批 2000 个活跃地址里，模型预期约 1/5 会在一个月内变沉默 —— 召回活动的
+  规模预算就是「活跃用户数 × 18%」；
+- **32.1% 高危**：将近 1/3 地址落在「高频套利者 / 噪音·机器人」簇，说明**先做女巫/刷量识别**
+  比直接发召回更划算；
+- **34 个簇 / 1940 个地址**：人群分层足够细，可支撑「大户一对一维护 + 噪音清理 + DeFi 农民加权益」
+  的分群运营；
+- **趋势价值**：本次结果已写入 `daily_snapshots` 与 `reports/last_run.json`，此后每天增量跑一次
+  即可得到留存曲线 / 流失率趋势（**单次给结论，长期给趋势**）。
+
+---
+
+## 21. 四个「看起来是玄学」的问题：从现象到根因的排查过程
+
+> 这一节记录思考路径而不是结论本身 —— 结论都在代码里，**过程**才是可复用的资产。
+
+### 21.1 浏览器「已打开」却毫无动静：`webbrowser` 在 macOS 上其实没成功
+
+- **现象**：终端打印「已打开浏览器完成一次性授权；若未自动打开请手动访问: …」，但浏览器
+  **毫无动静**；每次都要手动复制那串 URL 才能继续（授权、状态页同样）。
+- **第一轮假设 → 逐一证伪**：
+  1. 怀疑 `webbrowser` 模块不可用 → `python -c "import webbrowser;print(webbrowser.get())"`
+     输出 `<webbrowser.MacOSXOSAScript object>`：模块在，控制器也在；
+  2. 怀疑 `BROWSER` 环境变量被设成怪值 → `echo $BROWSER` 为空，排除；
+  3. 直接用三条命令对照实测：`open <file>`（`exit=0`）、`webbrowser.open('file://…')`
+     （`return=True`）、`open -a 'Google Chrome' <url>`（`exit=0`）。
+- **关键洞察**：**`webbrowser.open()` 的返回值会骗人**。macOS 上 CPython 的 `webbrowser`
+  优先注册 `MacOSXOSAScript`，它靠 `osascript -e 'tell application "…" to open location'`
+  打开页面 —— 这需要用户在「系统设置 → 隐私与安全性 → 自动化」里授权**当前终端 App 去控制
+  浏览器**。没授权时 osascript 失败，而 `webbrowser.open()` 仍可能返回 `True`，
+  于是呈现为「看起来成功、屏幕上什么都没发生」。这解释了为什么"指令发了但没唤起"。
+- **修法**（`src/notify.py`）：
+  - 新增 `open_browser(url)`：按 **`/usr/bin/open`（LaunchServices，不依赖自动化授权）→
+    `open -a "Google Chrome"` → Python `webbrowser` 兜底** 的顺序尝试，**每条都检查 returncode**，
+    并打印**实际命中的策略**（`已唤起浏览器（open（默认浏览器））：…`）；本地路径自动转 `file://`；
+    全失败时打印可手动复制的链接并返回 `False`（不抛异常，绝不因此中断流水线）；
+  - `--oauth-login` 与 `src/deliver.py: open_page()`（运行状态页）统一改走它 —— 一处修好，两处受益。
+- **测试案例**（用户可直接跑）：`python -m src.notify --open-test`
+  → 生成本地测试页并尝试打开，日志打印命中策略；实测 `已唤起浏览器（open（默认浏览器））`，
+  浏览器弹出「✅ 自动唤起浏览器成功」页。单测三条：首选成功、全部失败返回 `False`、
+  本地路径转 `file://`。
+
+### 21.2 为什么必须放弃 SMTP：四条出站路径全部超时
+
+- **现象**：`python -m src.notify` 报 `email=False`，`_ssl.c:999: The handshake operation timed out`。
+- **排查思路：把「TCP 可连」和「TLS 可通」拆开看**（这是判断黑洞阻断的关键）：
+  1. `nc -z smtp.gmail.com 465` / `587` **都 succeeded** —— 端口没被 RST，看起来"网络没问题"；
+  2. 但真正握手时 `context.wrap_socket()` / `STARTTLS` 会一直挂到超时 ⇒ 典型的
+     **「TCP 能连、TLS 被黑洞」**（GFW 对 SMTP 的常见处理方式）；
+  3. 于是做**矩阵测量**（代理/直连 × 465/587），一次跑清楚到底有没有活路：
+
+     ```
+     [FAIL] 465 via proxy   8.0s  TimeoutError: _ssl.c:999: The handshake operation timed out
+     [FAIL] 587 via proxy   8.0s  SMTPServerDisconnected: Connection unexpectedly closed
+     [FAIL] 587 direct      8.0s  SMTPServerDisconnected: Connection unexpectedly closed
+     [FAIL] 465 direct      8.0s  TimeoutError: _ssl.c:999: The handshake operation timed out
+     ```
+
+  4. 结论：**本机网络下 SMTP 整条不可用**（连 Clash 的 CONNECT 隧道都过不去 465 的 TLS），
+     所以「email=False」不是代码 bug，继续修 SMTP 是白费力气 —— **必须换走 443 的 Gmail API**。
+- **顺带修掉的两个真问题**：
+  - `SMTP_PROXY` 未单独配置时**自动复用 `FETCH_PROXY`**（只维护一条出口线就够，
+    见 §19.2）；`FETCH_PROXY=direct` 时邮件 / Google API / 抓取三者统一不走代理，避免"以为直连实际走代理"；
+  - `send_email()` 从「Gmail API 失败就 `return False`」改成 **Gmail API 优先 → 失败自动回退 SMTP**，
+    两条都失败才返回 False，并把 Google 的英文报错翻译成可执行提示。
+- **回归测试**：`test_send_email_falls_back_to_smtp_when_gmail_api_is_disabled`、
+  `test_send_email_without_smtp_credentials_reports_and_gives_up`、
+  `test_smtp_proxy_reuses_fetch_proxy_unless_direct`。
+
+
+
+
+### 21.3 Gmail API `403: has not been used in project … or it is disabled`：做成「自愈」
+
+- **现象**：OAuth 授权完全成功（`GMAIL_REFRESH_TOKEN` 已写回 `environment.env`），但发信仍然
+  403：`Gmail API has not been used in project 849097115397 before or it is disabled. Enable it by
+  visiting https://cons…`。注意这是 **403 而不是 401** —— 说明**身份验证没问题**，
+  是「这个 API 在项目里没开」。
+- **第一次尝试（走错了，但很有信息量）**：想用 `users.getProfile` 探测项目号 → 返回
+  `403 Request had insufficient authentication scopes`。原因：当前 token 只有 `gmail.send`，
+  读 profile 需要更宽的 scope。**教训：探测某个接口前，先确认手上的凭证有权限访问那个接口。**
+- **正确做法**：用**发信端点**做探测 —— API 未启用时 Google 会先返回 `accessNotConfigured`，
+  正文里恰好带着 `project <号码>`。一条正则就能拿到项目号（实测 `849097115397`），
+  且探测用的是一封空 MIME，**API 未启用时不会真发信**。
+- **自愈实现**（`python -m src.notify --enable-gmail-api`，一次「允许」点击换全自动）：
+  1. 重新授权时 scope 额外带上 `https://www.googleapis.com/auth/cloud-platform`
+     （服务启用所需的最小可行 scope）；
+  2. 用新 token POST
+     `https://serviceusage.googleapis.com/v1/projects/{项目号}/services/gmail.googleapis.com:enable`；
+  3. 轮询 `getProfile`（GET，200 = 已生效）最多 3 分钟 —— **不猜「应该好了」，用探针确认**；
+  4. 生效后立刻发一封自检邮件，把「API 启用 + 邮件发送」两个结果打印出来。
+- **兜底**：如果调用 Service Usage 返回 403（没有项目 Owner / Service Usage Admin 权限），
+  日志直接给出 Cloud Console 的启用链接 —— 手动点一下同样能解决。
+- **报错翻译层**（`_gmail_api_hint()`）：403「API 未启用」→ 启用链接 + 项目号；
+  401 / `invalid_grant` → 「重新跑 `--oauth-login`」；`insufficient`/`PERMISSION_DENIED` → scope 提示；
+  其它错误返回空串（不硬造建议）。这样每种失败都自带下一步动作，不用回来翻文档。
+- **回归测试**：`test_gmail_api_hint_turns_403_into_actionable_steps`、
+  `test_gmail_send_raises_typed_error_with_hint`、`test_gmail_project_number_parsed_from_403`、
+  `test_enable_gmail_api_calls_serviceusage_and_polls`。
+
+### 21.4 一键启动「闷声跑」：看不见进度 = 不知道命令是否生效
+
+- **现象**：`docker compose up -d` 一行就返回，之后管道在容器里默默跑几个小时，终端毫无输出，
+  很容易让人以为命令没生效（用户原话：「不知道的还以为命令无效呢」）。
+- **修法（三层）**：
+  1. **库层** `src/progress.py`：`bar()/stage()/stage_done()/banner()`；默认打印**整行**
+     （容器日志 / 重定向都能看见），仅当 stdout 是 TTY 时才用 `\r` 原地刷新；
+  2. **阶段层**：`scripts/run_pipeline.py` 给 ①抓取 ②特征 ③聚类 ④预测（⑤交付）编号并打印耗时；
+     `src/data_fetcher.py` 每 10 个地址打印 `[█████░░░] 62% 1240/2000` 进度条；
+     `docker-entrypoint.sh` 启动即打印步骤清单；
+  3. **入口层** `start.sh` 重写：构建 → **把 `docker compose logs -f` 流到本终端** → 等看板健康
+     → 等**本次运行新写**的 `reports/status.html`（比对 mtime，避免打开上次的旧页面）
+     → 自动打开状态页 + 看板 → 打印**四去向链接清单**；`NO_OPEN=1` 可关掉自动打开。
+- **验证**：`pytest` 35 passed（含 `test_progress_bar_formats_percentage_and_width`）；
+  本机 `python -m src.notify --open-test` 与阶段化 dry-run 均按预期打印。
+
+---
+
+## 22. 待办 / 未来可优化点
 
 见 README 的「未来可优化点」与「下一步优化」章节（LLM 生成建议、全量 12000 节点、
 多链支持、图神经网络、增量特征、模型监控等）。

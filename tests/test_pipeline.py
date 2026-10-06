@@ -314,6 +314,273 @@ def test_status_page_writes_html(tmp_path, monkeypatch):
     assert "2000 / 12000" in text
 
 
+def test_parse_oauth_redirect_accepts_url_and_raw_code():
+    url = ("http://localhost:8765/?iss=https://accounts.google.com"
+           "&code=4/0AXlqoi7d4NLeA&scope=https://www.googleapis.com/auth/gmail.send")
+    parsed = notify.parse_oauth_redirect(url)
+    assert parsed["code"] == "4/0AXlqoi7d4NLeA"          # 用户从地址栏整条 URL 贴回来
+    assert parsed["iss"] == "https://accounts.google.com"
+    assert notify.parse_oauth_redirect("4/0AXlqoi7d4NLeA")["code"] == "4/0AXlqoi7d4NLeA"
+    assert notify.parse_oauth_redirect("code=xyz")["code"] == "xyz"
+    err = notify.parse_oauth_redirect("http://localhost:8765/?error=access_denied")
+    assert err["error"] == "access_denied"
+    assert notify.parse_oauth_redirect("") == {}
+
+
+@pytest.mark.parametrize("host,port", [("127.0.0.1", 18766), ("[::1]", 18767)])
+def test_oauth_callback_server_listens_on_ipv4_and_ipv6(host, port):
+    """回调用例：macOS 上 Chrome 把 localhost 解析成 ::1 —— 必须双栈监听。
+
+    顺带回归「/favicon.ico 等杂包吃掉唯一一次 handle_request()」的老 bug。
+    """
+    import threading
+    import time
+    import urllib.request
+
+    holder: dict = {}
+    thread = threading.Thread(
+        target=lambda: holder.update(
+            notify._serve_callback(f"http://localhost:{port}/", 20)), daemon=True)
+    thread.start()
+    time.sleep(0.6)
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.ico", timeout=5) as resp:
+            assert resp.status == 204                     # 杂包 → 204，且不当作回调
+    except OSError as exc:                                # pragma: no cover - 无 IPv6 的环境
+        pytest.skip(f"该环境不支持本地回环监听: {exc}")
+    assert holder == {}
+    with urllib.request.urlopen(f"http://{host}:{port}/?code=ABC123", timeout=5) as resp:
+        assert resp.status == 200
+    thread.join(timeout=10)
+    assert holder.get("code") == "ABC123"
+
+
+def test_oauth_persist_env_value_updates_in_place(tmp_path, monkeypatch):
+    env = tmp_path / "environment.env"
+    env.write_text("SMTP_USER=a@b.c\nGMAIL_REFRESH_TOKEN=\n", encoding="utf-8")
+    monkeypatch.setattr(notify.config, "PROJECT_ROOT", tmp_path)
+    assert notify._persist_env_value("GMAIL_REFRESH_TOKEN", "NEW_TOKEN") == str(env)
+    text = env.read_text(encoding="utf-8")
+    assert "GMAIL_REFRESH_TOKEN=NEW_TOKEN" in text
+    assert "SMTP_USER=a@b.c" in text                      # 其它行原样保留
+    assert text.count("GMAIL_REFRESH_TOKEN=") == 1        # 原地替换，不重复追加
+    notify._persist_env_value("FETCH_PROXY", "http://127.0.0.1:7897")
+    assert "FETCH_PROXY=http://127.0.0.1:7897" in env.read_text(encoding="utf-8")
+
+
+def test_fetch_proxy_config_and_client_routes(monkeypatch):
+    from src import config, data_fetcher
+    monkeypatch.setattr(config, "FETCH_PROXY", "127.0.0.1:7897")     # 省略 scheme 也能用
+    assert config.http_proxies() == {"http": "http://127.0.0.1:7897",
+                                     "https": "http://127.0.0.1:7897"}
+    client = data_fetcher.EtherscanClient("KEY", delay=0)
+    labels = [label for _, label in client.routes]
+    assert labels[0].startswith("代理") and labels[-1] == "直连"      # 代理失败自动回落
+    assert client.session.trust_env is True
+
+    monkeypatch.setattr(config, "FETCH_PROXY", "direct")             # 强制直连
+    assert config.http_proxies() is None
+    direct = data_fetcher.EtherscanClient("KEY", delay=0)
+    assert direct.proxies is None and direct.routes == [(None, "直连")]
+    assert direct.session.trust_env is False                        # 不再读系统代理
+
+
+def test_fetcher_falls_back_to_direct_when_proxy_is_down(monkeypatch):
+    """代理挂了不能整个抓取都失败：整条代理重试链失败后自动切直连。"""
+    from src import config, data_fetcher
+    monkeypatch.setattr(config, "FETCH_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setattr(config, "HTTP_RETRIES", 2)
+    monkeypatch.setattr(data_fetcher.time, "sleep", lambda *_: None)
+
+    client = data_fetcher.EtherscanClient("KEY", delay=0)
+    seen = []
+
+    class FakeResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"status": "1", "result": []}
+
+    def fake_get(url, params=None, timeout=None, proxies=None):
+        seen.append(proxies)
+        if proxies:                                   # 代理不通
+            raise data_fetcher.requests.ConnectTimeout("proxy down")
+        return FakeResp()
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    assert client._get({"module": "account", "action": "txlist"}) == {"status": "1", "result": []}
+    assert seen[0] is not None and seen[-1] is None    # 先走代理，再回落直连
+    assert client.via == "直连"
+
+
+def test_open_browser_prefers_launch_services(monkeypatch):
+    """macOS 先试 ``/usr/bin/open``（LaunchServices，不依赖「自动化」授权）。"""
+    calls = []
+
+    class Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(notify.subprocess, "run",
+                        lambda cmd, **kwargs: (calls.append(cmd), Proc())[1])
+    assert notify.open_browser("https://example.com/x") is True
+    assert calls == [["open", "https://example.com/x"]]      # 第一条就成功，不再往下试
+
+
+def test_open_browser_falls_back_to_webbrowser_then_reports_failure(monkeypatch):
+    """``open`` 全失败 → 退到 Python webbrowser；再失败 → 返回 False（不抛异常）。"""
+    tried = []
+
+    class Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "Unable to find application"
+
+    monkeypatch.setattr(notify.subprocess, "run",
+                        lambda cmd, **kwargs: (tried.append(cmd), Proc())[1])
+    monkeypatch.setattr("webbrowser.open", lambda url: True)
+    assert notify.open_browser("https://example.com/y") is True
+    assert tried and tried[0][0] == "open"                    # 先试过 LaunchServices
+
+    monkeypatch.setattr("webbrowser.open", lambda url: False)
+    assert notify.open_browser("https://example.com/z") is False   # 全失败：False，不抛
+    assert notify.open_browser("") is False                        # 空串安全返回
+
+
+def test_open_browser_accepts_local_paths(monkeypatch):
+    """传本地路径时自动转成 ``file://``（运行状态页走的就是这条路）。"""
+    seen = []
+
+    class Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(notify.subprocess, "run",
+                        lambda cmd, **kwargs: (seen.append(cmd), Proc())[1])
+    notify.open_browser("/tmp/status.html")
+    assert seen[0][1].startswith("file:///") and seen[0][1].endswith("status.html")
+
+
+def test_gmail_api_hint_turns_403_into_actionable_steps():
+    hint = notify._gmail_api_hint(
+        403, 'Gmail API has not been used in project 849097115397 before or it is disabled.')
+    assert "gmail.googleapis.com" in hint and "849097115397" in hint and "启用" in hint
+    assert "oauth-login" in notify._gmail_api_hint(401, '{"error": "invalid_grant"}')
+    assert notify._gmail_api_hint(400, "some other error") == ""
+
+
+def test_gmail_send_raises_typed_error_with_hint(monkeypatch):
+    class Resp:
+        status_code = 403
+        text = 'Gmail API has not been used in project 849097115397 before'
+
+    monkeypatch.setattr(notify, "_gmail_access_token", lambda: "token")
+    monkeypatch.setattr(notify, "_post_json", lambda *a, **k: (Resp(), "代理"))
+    with pytest.raises(notify.GmailApiError) as err:
+        notify.send_email_via_gmail_api(notify.MIMEMultipart("alternative"))
+    assert err.value.status == 403 and "849097115397" in err.value.hint
+
+
+def test_send_email_falls_back_to_smtp_when_gmail_api_is_disabled(monkeypatch):
+    """Gmail API 403（API 未启用）不是终点：自动改走 SMTP，邮件照样发得出去。"""
+    from src import config
+    monkeypatch.setattr(config, "GMAIL_CLIENT_ID", "cid")
+    monkeypatch.setattr(config, "GMAIL_CLIENT_SECRET", "sec")
+    monkeypatch.setattr(config, "GMAIL_REFRESH_TOKEN", "rt")
+    monkeypatch.setattr(config, "SMTP_USER", "u@gmail.com")
+    monkeypatch.setattr(config, "SMTP_PASS", "pw")
+    monkeypatch.setattr(notify, "send_email_via_gmail_api",
+                        lambda msg: (_ for _ in ()).throw(
+                            notify.GmailApiError("HTTP 403", hint="hint", status=403)))
+    used = {}
+    monkeypatch.setattr(notify, "_send_email_via_smtp",
+                        lambda msg, to: (used.update(to=to), True)[1])
+    assert notify.send_email("主题", "<p>正文</p>", to="a@b.c") is True
+    assert used["to"] == "a@b.c"
+
+
+def test_send_email_without_smtp_credentials_reports_and_gives_up(monkeypatch):
+    from src import config
+    monkeypatch.setattr(config, "GMAIL_CLIENT_ID", "cid")
+    monkeypatch.setattr(config, "GMAIL_CLIENT_SECRET", "sec")
+    monkeypatch.setattr(config, "GMAIL_REFRESH_TOKEN", "rt")
+    monkeypatch.setattr(config, "SMTP_USER", "")
+    monkeypatch.setattr(config, "SMTP_PASS", "")
+    monkeypatch.setattr(notify, "send_email_via_gmail_api",
+                        lambda msg: (_ for _ in ()).throw(
+                            notify.GmailApiError("HTTP 403", hint="hint", status=403)))
+    assert notify.send_email("主题", "<p>正文</p>", to="a@b.c") is False
+
+
+def test_enable_gmail_api_calls_serviceusage_and_polls(monkeypatch):
+    """403 自愈：把 ``gmail.googleapis.com`` 在项目里启用，然后轮询到生效。"""
+    monkeypatch.setattr(notify, "_gmail_access_token", lambda: "tok")
+    monkeypatch.setattr(notify, "_gmail_project_number", lambda token: "849097115397")
+    monkeypatch.setattr(notify, "_gmail_api_ready", lambda token: True)
+    monkeypatch.setattr(notify.time, "sleep", lambda *_: None)
+    posted = {}
+
+    class Resp:
+        status_code = 200
+        text = "{}"
+
+    def fake_post(url, payload, timeout=15, prefer_proxy=True, headers=None):
+        posted["url"] = url
+        return Resp(), "代理"
+
+    monkeypatch.setattr(notify, "_post_json", fake_post)
+    assert notify.enable_gmail_api() is True
+    assert "projects/849097115397/services/gmail.googleapis.com:enable" in posted["url"]
+
+
+def test_gmail_project_number_parsed_from_403(monkeypatch):
+    class Resp:
+        status_code = 403
+        text = '{"error": {"message": "Gmail API has not been used in project 849097115397"}}'
+
+    monkeypatch.setattr(notify, "_post_json", lambda *a, **k: (Resp(), "代理"))
+    assert notify._gmail_project_number("tok") == "849097115397"
+
+    class Ok(Resp):
+        status_code = 200
+
+    monkeypatch.setattr(notify, "_post_json", lambda *a, **k: (Ok(), "代理"))
+    assert notify._gmail_project_number("tok") == ""          # 已启用 → 空串
+
+
+def test_progress_bar_formats_percentage_and_width():
+    from src import progress
+    line = progress.bar(1245, 2000, label="抓取地址")
+    assert "62%" in line and "1245/2000" in line and "抓取地址" in line
+    assert line.count("█") + line.count("░") == progress.BAR_WIDTH
+    assert progress.bar(0, 0).endswith("0/1")                 # 除零保护
+    assert progress.bar(9, 3).endswith("3/3")                 # 越界截断
+
+
+def test_smtp_proxy_reuses_fetch_proxy_unless_direct(monkeypatch):
+    """只配一条出口线时，邮件/Google API 复用抓取出口；抓取配 direct 则都不走代理。"""
+    import importlib
+    from src import config
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: None)   # 屏蔽真实 env 文件
+    for name in ("SMTP_PROXY", "NET_PROXY", "FETCH_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+
+    monkeypatch.setenv("FETCH_PROXY", "127.0.0.1:7897")
+    reloaded = importlib.reload(config)
+    assert reloaded.SMTP_PROXY == "http://127.0.0.1:7897"
+    assert reloaded.NET_PROXY == "http://127.0.0.1:7897"
+
+    monkeypatch.setenv("FETCH_PROXY", "direct")
+    reloaded = importlib.reload(config)
+    assert reloaded.SMTP_PROXY == "" and reloaded.NET_PROXY == ""
+
+    monkeypatch.undo()                       # 还原环境变量与 dotenv 打桩
+    importlib.reload(config)                 # 重新读回 environment.env，别影响后续用例
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

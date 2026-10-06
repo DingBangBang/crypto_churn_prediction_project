@@ -12,6 +12,10 @@ Highlights
   ``BASE_RATE_LIMIT_DELAY`` between requests and exponential back-off on 429.
 * Idempotent: writes use ``INSERT OR IGNORE`` on ``(address, tx_hash, tx_type)`` so
   re-running the fetcher only adds genuinely new rows.
+* Egress routing: honours ``FETCH_PROXY`` (or the standard ``HTTPS_PROXY`` /
+  ``HTTP_PROXY``, falling back to ``NET_PROXY``); when a proxy is configured it is
+  tried first and the client falls back to a direct connection if the whole proxy
+  retry chain fails. ``FETCH_PROXY=direct`` forces a direct connection.
 * Test mode: with ``ADDRESS_LIMIT<=200`` the DB/figure names carry a ``_test`` suffix
   (see :mod:`src.config`).
 
@@ -19,6 +23,7 @@ Usage
 -----
 python src/data_fetcher.py               # uses ADDRESS_LIMIT from environment.env
 python src/data_fetcher.py --limit 200   # override for a test run
+FETCH_PROXY=http://127.0.0.1:7897 python -m src.data_fetcher --limit 5   # 经代理抓 5 个地址
 """
 from __future__ import annotations
 
@@ -36,7 +41,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src import config, db  # noqa: E402
+from src import config, db, progress  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,34 +66,74 @@ _TOKEN_SYMBOLS = {
 
 
 class EtherscanClient:
-    """Thin, rate-limited client around the Etherscan V2 API."""
+    """Thin, rate-limited client around the Etherscan V2 API.
 
-    def __init__(self, api_key: str, base_url: str | None = None, delay: float | None = None):
+    出站线路（见 :data:`src.config.FETCH_PROXY`）：配置了代理时**优先走代理**，
+    代理整条重试链都失败后自动回落直连；``direct/none/off`` 则强制直连
+    （并关掉 ``trust_env``，不再读 macOS 系统代理）。
+    """
+
+    def __init__(self, api_key: str, base_url: str | None = None, delay: float | None = None,
+                 proxy: str | None = None):
         self.api_key = api_key
         self.base_url = base_url or config.ETHERSCAN_API_BASE_URL
         self.delay = config.BASE_RATE_LIMIT_DELAY if delay is None else delay
         self.retries = config.HTTP_RETRIES
         self.session = requests.Session()
+        # 代理：构造参数 > config.FETCH_PROXY。
+        self.proxy_spec = config.FETCH_PROXY if proxy is None else proxy
+        self.proxies = config.http_proxies(self.proxy_spec)
+        self.routes = self._build_routes()
+        self.via = ""           # 最近一次成功的出口标签（用于日志/排障）
+        # 显式 direct/none/off → 不读系统代理；否则信任环境（本地 TUN/系统代理可兜底）。
+        self.session.trust_env = not config.is_direct(self.proxy_spec)
+
+    def _build_routes(self) -> List[tuple]:
+        """按优先级排好出口：``[(proxies, 标签), …]``。"""
+        if self.proxies:
+            return [(self.proxies, f"代理 {self.proxies['https']}"), (None, "直连")]
+        return [(None, "直连")]
+
+    def route_label(self) -> str:
+        """人类可读的出口描述，用于启动日志。"""
+        return self.routes[0][1] + ("（代理失败自动回落直连）" if len(self.routes) > 1 else
+                                    ("" if self.proxies or self.session.trust_env is False
+                                     else "（含系统代理）"))
 
     # -- low level -------------------------------------------------------------
     def _get(self, params: Dict[str, Any], timeout: int = 20) -> Optional[dict]:
         """GET one Etherscan call with retry/back-off; returns ``None`` on failure."""
         query = {**params, "chainid": str(config.CHAIN_ID), "apikey": self.api_key}
+        for proxies, label in self.routes:
+            data = self._get_via(query, params.get("action"), timeout, proxies, label)
+            if data is not None:
+                if label != self.via:
+                    self.via = label
+                    logger.info("抓取出口：%s", label)
+                return data
+            if len(self.routes) > 1:
+                logger.warning("出口「%s」不可用，切换到下一条线路", label)
+        return None
+
+    def _get_via(self, query: Dict[str, Any], action: Any, timeout: int,
+                 proxies: Optional[dict], label: str) -> Optional[dict]:
+        """Single-route retry loop (kept separate so ``_get`` can fall back)."""
         for attempt in range(1, self.retries + 1):
             try:
                 time.sleep(self.delay)
-                resp = self.session.get(self.base_url, params=query, timeout=timeout)
+                resp = self.session.get(self.base_url, params=query, timeout=timeout,
+                                        proxies=proxies)
                 resp.raise_for_status()
                 data = resp.json()
             except (requests.RequestException, ValueError) as exc:
-                logger.warning("request failed (%s/%s) %s: %s", attempt, self.retries,
-                               params.get("action"), exc)
+                logger.warning("request failed (%s/%s) %s [%s]: %s",
+                               attempt, self.retries, action, label, exc)
                 time.sleep(min(2 ** attempt, 10))
                 continue
 
             result = data.get("result")
             if isinstance(result, str) and "rate limit" in result.lower():
-                logger.warning("rate-limited on %s, backing off", params.get("action"))
+                logger.warning("rate-limited on %s, backing off", action)
                 time.sleep(min(2 ** attempt, 15))
                 continue
             return data
@@ -244,10 +289,12 @@ def _insert_rows(conn, rows: List[Dict[str, Any]]) -> int:
 
 
 # --- orchestration ------------------------------------------------------------
-def fetch_population(limit: int | None = None) -> List[str]:
+def fetch_population(limit: int | None = None, proxy: str | None = None) -> List[str]:
     """BFS-expand the seed addresses to ``limit`` addresses and fetch their txs.
 
     Returns the list of watched addresses that were (attempted to be) fetched.
+    ``proxy`` overrides :data:`src.config.FETCH_PROXY` (``direct`` forces a direct
+    connection); ``None`` keeps the configured value.
     """
     limit = limit or config.ADDRESS_LIMIT
     if not config.ETHERSCAN_API_KEY:
@@ -256,7 +303,7 @@ def fetch_population(limit: int | None = None) -> List[str]:
         )
 
     conn = db.connect()
-    client = EtherscanClient(config.ETHERSCAN_API_KEY)
+    client = EtherscanClient(config.ETHERSCAN_API_KEY, proxy=proxy)
 
     queue: deque[str] = deque(a.lower() for a in config.SEED_ADDRESSES)
     seen: set[str] = set()
@@ -265,6 +312,7 @@ def fetch_population(limit: int | None = None) -> List[str]:
     t0 = time.time()
 
     logger.info("测试模式=%s | 目标地址数=%d | DB=%s", config.TEST_MODE, limit, config.DB_PATH)
+    logger.info("抓取出口：%s", client.route_label())
 
     while len(watched) < limit and queue:
         addr = queue.popleft()
@@ -294,8 +342,9 @@ def fetch_population(limit: int | None = None) -> List[str]:
         if len(watched) % 10 == 0 or len(watched) == limit:
             elapsed = time.time() - t0
             logger.info(
-                "已抓取 %d/%d 地址 | 新增 %d 条 | 队列 %d | 用时 %.0fs",
-                len(watched), limit, total_rows, len(queue), elapsed,
+                "已抓取 %d/%d 地址 %s | 新增 %d 条 | 队列 %d | 用时 %.0fs",
+                len(watched), limit, progress.bar(len(watched), limit, label="抓取地址"),
+                total_rows, len(queue), elapsed,
             )
 
     db.record_run(conn, "data_fetcher", "ok",
@@ -314,8 +363,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Fetch Ethereum transactions into SQLite.")
     parser.add_argument("--limit", type=int, default=None,
                         help="max addresses (defaults to ADDRESS_LIMIT)")
+    parser.add_argument("--proxy", default=None,
+                        help="出站代理，如 http://127.0.0.1:7897；direct 强制直连"
+                             "（默认取 FETCH_PROXY/HTTPS_PROXY/NET_PROXY）")
     args = parser.parse_args(argv)
-    fetch_population(args.limit)
+    fetch_population(args.limit, proxy=args.proxy)
     return 0
 
 

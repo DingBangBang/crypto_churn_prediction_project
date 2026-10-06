@@ -193,6 +193,58 @@ RISK_CRITICAL_MULTIPLIER = _get_float("RISK_CRITICAL_MULTIPLIER", 1.5)
 # 只连 TCP 通、握手会挂死。统一走本地代理即可。
 NET_PROXY = os.getenv("NET_PROXY", "") or SMTP_PROXY
 
+# --- 出站网络代理（Etherscan 抓取专用）------------------------------------------
+# 抓取走的是 https://api.etherscan.io。要不要走代理取决于线路：
+#   * 本地开 Clash/mihomo 的 TUN/系统代理时，requests 会自动读系统代理（trust_env），
+#     通常不填也能通；但**容器里没有系统代理**，必须显式给值。
+#   * 优先级：FETCH_PROXY > 标准变量 HTTPS_PROXY/HTTP_PROXY > NET_PROXY（=SMTP_PROXY）。
+#   * 特殊值 direct / none / off → 强制直连（绕过系统代理），便于排查与离线测试。
+#   * Docker 里要用宿主机代理请填 http://host.docker.internal:7897（compose 已加 extra_hosts）。
+FETCH_PROXY = (
+    os.getenv("FETCH_PROXY", "").strip()
+    or os.getenv("HTTPS_PROXY", "").strip()
+    or os.getenv("https_proxy", "").strip()
+    or os.getenv("HTTP_PROXY", "").strip()
+    or os.getenv("http_proxy", "").strip()
+    or NET_PROXY
+)
+# 「强制直连」的字面量（大小写不敏感）。
+FETCH_PROXY_DIRECT_VALUES = ("direct", "none", "off")
+
+
+def normalize_proxy(proxy: str) -> str:
+    """``127.0.0.1:7897`` → ``http://127.0.0.1:7897``（已带 scheme 则原样返回）。"""
+    proxy = (proxy or "").strip()
+    if proxy and "//" not in proxy and not is_direct(proxy):
+        proxy = "http://" + proxy
+    return proxy
+
+
+def is_direct(proxy: str) -> bool:
+    """``direct`` / ``none`` / ``off`` → 强制直连（不读系统代理）。"""
+    return (proxy or "").strip().lower() in FETCH_PROXY_DIRECT_VALUES
+
+
+def http_proxies(proxy: str | None = None) -> dict | None:
+    """``requests`` 用的 ``proxies`` 映射；空值/``direct`` 返回 ``None``（表示直连）。
+
+    默认取 :data:`FETCH_PROXY`；传 ``proxy=""`` 可显式要求直连。
+    """
+    value = FETCH_PROXY if proxy is None else proxy
+    if not value or is_direct(value):
+        return None
+    value = normalize_proxy(value)
+    return {"http": value, "https": value}
+
+
+# --- 邮件 / Google API 出口复用抓取出口 -----------------------------------------
+# 只配了一条出口线（FETCH_PROXY）时，邮件与 Google API 也走同一条：
+# 这样「断网只改一个变量」就能全局切换；抓取显式配了 direct/none/off 则邮件也不硬走代理。
+if not SMTP_PROXY and not is_direct(FETCH_PROXY):
+    SMTP_PROXY = normalize_proxy(FETCH_PROXY)
+if not NET_PROXY:
+    NET_PROXY = SMTP_PROXY
+
 # --- Gmail OAuth2（Google 已下线「应用专用密码」后的正规发信方式）----------------
 # 需要 Google Cloud OAuth 客户端（类型：桌面应用）：
 #   GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET + 一次性授权拿到的 GMAIL_REFRESH_TOKEN
@@ -203,6 +255,13 @@ GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
 GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+# 可选：把「启用 Gmail API」也纳入授权范围，这样 403「API 未启用」能被代码自愈：
+#   python -m src.notify --enable-gmail-api
+# 只需多一次「允许」点击，之后代码自己调 Service Usage API 启用，不用去 Cloud Console 点。
+GMAIL_ENABLE_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+GMAIL_PROFILE_URL = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+SERVICEUSAGE_ENABLE_URL = ("https://serviceusage.googleapis.com/v1/projects/{project}"
+                           "/services/gmail.googleapis.com:enable")
 # 本地一次性授权用的回环地址（要与 OAuth 客户端里登记的重定向 URI 完全一致）
 GMAIL_REDIRECT_URI = os.getenv("GMAIL_REDIRECT_URI", "http://localhost:8765/")
 

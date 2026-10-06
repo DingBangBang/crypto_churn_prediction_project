@@ -1,10 +1,20 @@
 # 加密货币用户行为聚类分析与流失预测 — 一键堆栈
 #
 # `docker compose up -d --build` 会：构建镜像 -> 首次启动自动跑完整流水线
-# (data_fetcher -> feature_engineer -> cluster_analyzer -> churn_model) -> 启动
-# Streamlit 看板 (http://localhost:8501)。之后重启会直接启动看板（用 marker 判断）。
+# (data_fetcher -> feature_engineer -> cluster_analyzer -> churn_model) ->
+# **顺手把四个去向都交付掉**（邮件 / Lark 卡片 / reports/status.html 运行状态页 /
+# 快照 + 运行元数据）-> 启动 Streamlit 看板 (http://localhost:8501)。
+# 之后重启会直接启动看板（用 marker 判断）；若此时想补发四去向，容器会用
+# `scripts/daily_run.py --deliver-only` 复用已有预测结果重发（见 docker-entrypoint.sh）。
 #
-# 想“跑完自动打开浏览器”，用根目录的 ./start.sh（它会 up 之后等待并 open 页面）。
+# 说明：容器内**不能**弹 macOS 通知、也不能打开浏览器（无 GUI），所以：
+#   * 通知与「自动打开」由宿主机负责 —— 用根目录的 ./start.sh（up 之后把容器日志
+#     **实时流到终端**并等待就绪，最后自动打开看板 + reports/status.html）；
+#   * 状态页写在挂载出去的 ./reports/status.html，宿主机双击即可看全部内容。
+# 进度可见性：`./start.sh`（推荐）或 `docker compose up --build`（前台）或
+#   `docker compose logs -f churn-app`（后台跑时另开终端），日志里含
+#   `[3/5] ▶ 行为聚类（HDBSCAN）` 与 ` [████░░] 62% 1240/2000 抓取地址` 形式的进度条。
+# 想「只跑流水线、不推送」（例如 CI）：RUN_DELIVER=0 docker compose up -d --build
 services:
   churn-app:
     build: .
@@ -26,10 +36,22 @@ services:
       DASHBOARD_URL: "http://localhost:8501"
       # 设为 1 可强制下次启动重跑整个流水线。
       FORCE_PIPELINE: "${FORCE_PIPELINE:-0}"
+      # 1（默认）= 首启/补发时交付四个去向；0 = 只跑流水线（CI / 只想拿数据）。
+      RUN_DELIVER: "${RUN_DELIVER:-1}"
+      # 容器内无 GUI：交付层据此跳过 macOS 通知与 open 浏览器（幂等，可覆盖）。
+      CHURN_HEADLESS: "${CHURN_HEADLESS:-1}"
+      # 注意：邮件/Lark 的收件人与 webhook **不要**在这里写死（会覆盖 env_file），
+      # 统一放 environment.env，由 env_file 注入。
+      # 抓取同理：容器里没有 macOS 系统代理，要经宿主机代理抓 Etherscan 就在
+      # environment.env 里写 FETCH_PROXY=http://host.docker.internal:7897
+      # （下面的 extra_hosts 已把 host.docker.internal 指到宿主机）。
     ports:
       - "8501:8501"
+    extra_hosts:
+      # 让容器能用 host.docker.internal 访问宿主机上的 Clash/mihomo 代理端口。
+      - "host.docker.internal:host-gateway"
     volumes:
-      # SQLite 数据库（宿主可读，方便备份/迁移）与生成的报告。
+      # SQLite 数据库（宿主可读，方便备份/迁移）与生成的报告/状态页。
       - ./data:/app/data:rw
       - ./reports:/app/reports:rw
     healthcheck:
