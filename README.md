@@ -329,9 +329,9 @@ docker push bonnie333333333/crypto-churn-prediction:latest
 8. **实时化**：结合 Whale 项目的准实时管道，把"离线建模"与"在线打分"打通。
 
 ---
-
+## 🧑‍💼 给业务同学的大白话解释
 <details>
-<summary>🧑‍💼 给业务同学的大白话解释（点开）</summary>
+<summary>点击查看</summary>
 
 把每个以太坊地址想成一位**用户**。我们去看他们过去半年在网上"做了什么、做了多少、跟谁玩"，
 然后回答三个问题：
