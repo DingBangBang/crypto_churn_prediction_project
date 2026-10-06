@@ -147,7 +147,18 @@ HDBSCAN_MIN_SAMPLES = _get_int("HDBSCAN_MIN_SAMPLES", 2)
 # --- Churn model --------------------------------------------------------------
 TEST_SIZE = _get_float("TEST_SIZE", 0.3)
 RANDOM_STATE = _get_int("RANDOM_STATE", 42)
+# 主预测时间窗（30 天）：图表、模型阈值口径都以它为准。
 FORECAST_HORIZON_DAYS = _get_int("FORECAST_HORIZON_DAYS", 30)
+
+# --- 多时间窗预测 -------------------------------------------------------------
+# 一次性给出 1 / 7 / 14 / 30 / 90 天几个时间窗的流失率（同一份 ARIMA 拟合到最大窗，
+# 避免为每个窗口重复拟合）。主窗口 FORECAST_HORIZON_DAYS 会自动并入集合。
+_RAW_HORIZONS = [
+    h.strip() for h in (os.getenv("FORECAST_HORIZONS", "1,7,14,30,90") or "").split(",")
+    if h.strip().isdigit()
+]
+FORECAST_HORIZONS = sorted({int(h) for h in _RAW_HORIZONS} | {FORECAST_HORIZON_DAYS}) or [30]
+FORECAST_MAX_DAYS = max(FORECAST_HORIZONS)
 
 # --- Alerts -------------------------------------------------------------------
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
@@ -166,6 +177,16 @@ LARK_WEBHOOK_URL = os.getenv("LARK_WEBHOOK_URL", "")
 LARK_AT_ID = os.getenv("LARK_AT_ID", "") or os.getenv("LARK_AT_PHONE", "")
 ALERT_CHURN_RATE_THRESHOLD = _get_float("ALERT_CHURN_RATE_THRESHOLD", 0.40)
 ALERT_RISK_CLUSTER_RATIO = _get_float("ALERT_RISK_CLUSTER_RATIO", 0.25)
+
+# --- 风险等级（简报里「是否高危 / 是否必须重视」的判定）------------------------
+# 以「预测流失率 / ALERT_CHURN_RATE_THRESHOLD」的倍数分档：
+#   >= 1.5x → 🔴 高危      （必须立刻重视，拉相关方开会）
+#   >= 1.0x → 🟠 警戒      （已越线，进入处置流程）
+#   >= 0.75x → 🟡 关注     （接近阈值，监控 + 提前准备召回）
+#   否则     → 🟢 正常
+RISK_WATCH_MULTIPLIER = _get_float("RISK_WATCH_MULTIPLIER", 0.75)
+RISK_ALERT_MULTIPLIER = _get_float("RISK_ALERT_MULTIPLIER", 1.0)
+RISK_CRITICAL_MULTIPLIER = _get_float("RISK_CRITICAL_MULTIPLIER", 1.5)
 
 # --- 出站网络代理（邮件 / Google API 通用）--------------------------------------
 # 国内网络对 Google 系域名（含 smtp.gmail.com、oauth2.googleapis.com）常做 TLS 层阻断，
@@ -186,3 +207,5 @@ GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 GMAIL_REDIRECT_URI = os.getenv("GMAIL_REDIRECT_URI", "http://localhost:8765/")
 
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://localhost:8501")
+# 「运行状态页」：macOS 通知点开后展示运行状态 + 邮件/Lark/看板三方向链接与结果内容
+STATUS_PAGE = REPORTS_DIR / "status.html"

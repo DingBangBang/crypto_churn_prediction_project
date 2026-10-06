@@ -187,6 +187,86 @@
   （同名标题只取第一份）。
 - 结果：`insights.md` 从 89 行（重复两遍）回到稳定 42 行，新增单测 `test_read_insights_dedupes_and_strips_noise` 守住。
 
-## 12. 待办 / 未来可优化点
+## 12. 从「一句预警」到「一页可交付」：运行状态页 + 四出口同源
 
-见 README 的「未来可优化点」章节（多链支持、图神经网络、增量特征、模型监控等）。
+- 需求：macOS 通知点开之后必须能看到**①运行状态（每个阶段成功/失败）+ 报错内容
+  ②三个方向（邮件 / Lark / 看板）的入口与结果 ③结果内容（是否高危、多时间窗流失率、
+  聚类、洞察、初步推进建议）**。
+- 设计：新增 `src/status_page.py`，把 `src/notify.py` 里已经算好的口径（`collect_run_status()` /
+  `risk_level()` / `horizon_rows()` / `build_suggestions()` / `render_run_status_html()`）
+  直接渲染成一张自包含的本地 HTML（`reports/status.html`），**不依赖任何服务**，双击即可看。
+- 四出口同源：邮件 HTML、Lark 卡片、macOS 通知、状态页全部由同一批函数产出，避免「邮件说 51%、
+  卡片说 47%」这类口径漂移。
+- 运行状态的双来源：优先读 SQLite `pipeline_runs`（每个阶段 `db.record_run()` 写入，
+  含 detail 与时间），再叠加 `reports/last_run.json`（`daily_run` 结束/异常时写入，
+  含 ok / elapsed_s / error 原文），两者互补：前者回答「哪一步失败」，后者回答「整轮成败与耗时」。
+- 决策：`daily_run` 结束时**自动在浏览器打开状态页**，并把它作为纯文本通知的 `-open` 目标 ——
+  即使通知权限没开，信息也不会丢。
+
+## 13. Lark 只能发纯文本吗？—— 不是，用消息卡片（interactive + lark_md）
+
+- 结论：群机器人 webhook 支持三种形态：`text`（纯文本，不渲染 markdown）、
+  `post`（富文本，可加粗但**没有彩色标题栏**）、`interactive`（消息卡片，内部文本走
+  `lark_md` 方言，可真加粗 / 彩色 header / 分割线 / 超链接 / @）。
+- 做法：`build_digest_card()` 生成卡片 JSON（`header.template` 随状态与风险变色：
+  运行失败或 🔴 高危 = `red`，🟠 = `orange`，🟡 = `yellow`，🟢 = `green`），
+  卡片元素用 `hr` 分段；同时保留 `build_digest_text()` 生成的纯文本作为**降级兜底**
+  （`send_lark_digest()` 先试卡片，失败即回退文本）。
+- 踩坑：`lark_md` 里 `<font color='red'>` 只支持 `red/green/grey` 等有限色值，别乱写十六进制。
+- 自检：新增 `python -m src.notify --preview` —— **只渲染、不发送**，把
+  `reports/email_preview.html` 与 `reports/lark_card.json` 落盘，方便离线核对（不消耗配额、不需要代理）。
+
+## 14. macOS 通知「点击直达」：terminal-notifier 的权限坑与 file:// 要求
+
+- 安装：`brew install terminal-notifier`；它支持 `-open <url>`，点按通知即可打开目标页面。
+- 踩坑 1（**file:// 必需**）：`-open` 只接受合法 URL，直接传本地路径会报
+  `'...' is not a valid URL. It needs a scheme, such as https://… or file:///tmp`。
+  代码里已统一把本地路径规范化为 `file://<绝对路径>`。
+- 踩坑 2（**通知权限**）：Homebrew 公式里的裸 binary 会一直报
+  `Could not request notification permission: Notifications are not allowed for this application`，
+  且**不会**在「系统设置 → 通知」里出现。改用 app bundle 内的可执行文件
+  （`terminal-notifier.app/Contents/MacOS/terminal-notifier`）后 macOS 才会弹权限请求；
+  本项目额外把 `~/Applications/Terminal Notifier.app` 软链过去，便于在设置里找到并授权。
+- 兜底：任何失败（未授权 / 未安装 / 超时）都会自动回退到 `osascript display notification`
+  普通横幅，并打 WARNING 说明原因 —— 通知功能降级但绝不静默失败。
+- 踩坑 3（**必须在设置里能被看到**）：Homebrew 装的 app bundle 直接跑只会得到
+  `Notifications are not allowed for this application`，且**不会出现在「系统设置 → 通知」列表**里；
+  把 bundle **真实拷贝**到 `~/Applications/Terminal Notifier.app`（不要软链）并用
+  `lsregister -f` 向 LaunchServices 注册后，系统才认得它并给出可操作的提示
+  （`Notifications are turned off for this application … tccutil reset UserNotification
+  fr.julienxx.oss.terminal-notifier`）。开启路径：
+  `open "x-apple.systempreferences:com.apple.Notifications-Settings.extension"`。
+  代码 `_terminal_notifier()` 的候选顺序也据此调整为「~/Applications bundle → /Applications
+  bundle → Homebrew keg bundle → 裸 binary」。
+
+## 15. 多时间窗预测：一次 ARIMA 拟合服务 1/7/14/30/90 天
+
+- 原实现：对每个窗口分别拟合一次（30 天就拟合一次预测 30 天）→ 想做 5 个窗口要拟合 5 次，
+  在 2000 个地址上就是 5 倍算力。
+- 现实现：**只拟合到最大窗口**（`FORECAST_MAX_DAYS=90`），一次性拿到逐日预测序列，
+  再按窗口切片聚合出「平均日频次 / 频次降低值 / 平均流失率 / 末日流失率」。
+- 额外收益：能给出**短窗 vs 长窗结论** —— 短窗流失率 ≥ 长窗 ⇒「加速出逃，立刻干预」；
+  否则 ⇒「渐进式失活，仍有挽回窗口」。风险等级也由预测流失率 / 阈值倍数分档
+  （1.5× 高危 / 1.0× 警戒 / 0.75× 关注），保证「是否必须重视」有统一口径。
+
+## 16. 样本量与限流实测（为什么是 2000 而不是 12000）
+
+- 实测：免费 Etherscan Key 下，2000 个地址的抓取在 `rate-limited` 退避中约 **1900 秒才走完 190 个
+  地址**（每个地址约 4 个请求：balance / txlist / txlistinternal / tokentx），全量 12000 节点
+  在本机不可行。
+- 因此本项目把 2000 定为**链路可行性验证规模**：证明「抓取 → 特征 → 聚类 → 三模型 → 多窗口 ARIMA →
+  四出口推送」端到端能跑通；全量留给公司内部 Etherscan API / 归档节点，代码路径完全相同。
+
+## 17. Docker Hub 推送：5 分钟硬上限 + 分层续传（本次成功）
+
+- 背景：受限网络下 `docker push` 多次超时（1.63 GB 镜像，多阶段分层）。
+- 本次做法：`timeout 300 docker push …`（硬上限 5 分钟，超时即放弃，不在网络上赌时间），
+  失败后重试时 Docker 会**复用已上传的层**（日志里出现大量 `Layer already exists`），于是本次在
+  上限内完成：`latest: digest sha256:8f1eed0b4b6b90402d5b9412e13ef625199e1d756f6571c4274875c26b84fd8d`。
+- 结论：**分层 + 续传 + 硬上限**是弱网下最实用的组合；公司内网直接推 Harbor 更省事。
+
+## 18. 待办 / 未来可优化点
+
+
+见 README 的「未来可优化点」与「下一步优化」章节（LLM 生成建议、全量 12000 节点、
+多链支持、图神经网络、增量特征、模型监控等）。

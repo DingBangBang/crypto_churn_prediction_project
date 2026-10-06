@@ -196,6 +196,124 @@ def test_read_insights_dedupes_and_strips_noise(tmp_path, monkeypatch):
     assert "结论" in text
 
 
+def _fake_status(ok: bool = True, error: str = "") -> dict:
+    """Minimal stand-in for ``notify.collect_run_status()`` output (no DB touch)."""
+    failed = [] if ok else [{"stage": "churn_model", "status": "failed",
+                             "detail": "AUC 0.90", "ran_at": ""}]
+    return {
+        "ok": ok, "source": "last_run.json", "ran_at": "2026-10-06 21:00:00",
+        "elapsed_s": 123.4, "error": error, "failed": failed,
+        "stages": [
+            {"stage": "data_fetcher", "status": "ok", "detail": "2000 地址", "ran_at": ""},
+            {"stage": "churn_model", "status": "failed" if not ok else "ok",
+             "detail": "AUC 0.90", "ran_at": ""},
+        ],
+        "n_total": 2, "n_ok": 1 if not ok else 2,
+    }
+
+
+def test_risk_level_buckets():
+    assert notify.risk_level(0.70)["key"] == "critical"   # 1.75× 阈值
+    assert notify.risk_level(0.45)["key"] == "alert"
+    assert notify.risk_level(0.32)["key"] == "watch"
+    assert notify.risk_level(0.10)["key"] == "normal"
+    assert notify.risk_level(0.70)["must_act"] is True
+    assert notify.risk_level(0.10)["must_act"] is False
+
+
+def test_horizon_rows_and_markdown():
+    single = notify.horizon_rows({"forecast_churn_rate": 0.5, "horizon": 30,
+                                  "forecast_mean_freq": 3.2, "avg_freq_drop": 0.4})
+    assert len(single) == 1 and single[0]["horizon"] == 30
+    rows = notify.horizon_rows({"horizon_forecasts": {
+        "1": {"horizon": 1, "churn_rate": 0.5, "avg_daily_freq": 1.0, "freq_drop": 0.1},
+        "90": {"horizon": 90, "churn_rate": 0.2, "avg_daily_freq": 0.5, "freq_drop": 0.6}}})
+    assert [r["horizon"] for r in rows] == [1, 90]
+    md = notify.render_horizon_md(rows, 0.4)
+    assert "**1 天**" in md and "⚠️" in md               # 1 天越线
+    assert "加速出逃" in md                               # 短窗 ≥ 长窗 → 加速
+    text = notify.render_horizon_text(rows, 0.4)
+    assert all("**" not in line for line in text)
+
+
+def test_render_run_status_surfaces_error():
+    md = notify.render_run_status_md(_fake_status(ok=False, error="ValueError: boom"))
+    assert "❌ 失败" in md and "报错内容" in md and "ValueError: boom" in md
+    assert "① 数据抓取" in md
+    html_text = notify.render_run_status_html(_fake_status(ok=False, error="ValueError: boom"))
+    assert "ValueError: boom" in html_text and "<b>报错内容</b>" in html_text
+    assert "✅ 成功" in notify.render_run_status_md(_fake_status())
+
+
+def test_digest_text_leads_with_status_risk_and_windows():
+    digest = {"rows": [], "n_addresses": 0, "n_personas": 0, "n_noise": 0, "risk_ratio": 0.0}
+    summary = {"forecast_churn_rate": 0.62, "high_risk_ratio": 0.40, "avg_freq_drop": 9.0,
+               "current_mean_freq": 20.0, "final_day_freq": 11.0, "horizon": 30,
+               "horizon_forecasts": {
+                   "7": {"horizon": 7, "churn_rate": 0.60, "avg_daily_freq": 12.0,
+                         "freq_drop": 8.0}}}
+    text = notify.build_digest_text(summary, 0.0, digest=digest, insights="· 结论",
+                                    status=_fake_status())
+    lines = text.splitlines()
+    assert "每日简报" in lines[0]
+    assert "运行状态" in lines[3]                 # 头部 3 行之后紧接着运行状态
+    assert "🔴 高危" in text and "必须立刻重视" in text
+    assert "多时间窗流失率预测" in text and "- 7 天：流失率 60.0%" in text
+    assert "初步推进建议" in text
+    assert "**" not in text and "<font" not in text   # 纯文本通道不带 markdown/HTML 标记
+    assert "http://localhost:8501" in text
+
+
+def test_digest_card_is_structured_markdown():
+    digest = {"rows": [{"label": "高频大户", "n": 5, "pct": 0.5, "churn_rate": 0.6,
+                        "freq": 4.0, "holding": 8.0, "protocols": 3.0, "gas_ratio": 0.2,
+                        "balance": 1.0, "idle_days": 10.0}],
+              "n_addresses": 10, "n_personas": 1, "n_noise": 0, "risk_ratio": 0.1}
+    summary = {"forecast_churn_rate": 0.70, "high_risk_ratio": 0.50, "avg_freq_drop": 2.0,
+               "horizon": 30,
+               "horizon_forecasts": {"30": {"horizon": 30, "churn_rate": 0.70,
+                                            "avg_daily_freq": 1.0, "freq_drop": 2.0}}}
+    card = notify.build_digest_card(summary, 0.1, digest=digest, insights="· 结论",
+                                    status=_fake_status())
+    assert card["header"]["template"] == "red"          # 高危 → 红色标题栏
+    assert card["header"]["title"]["content"].endswith("每日简报")
+    content = " ".join(e["text"]["content"] for e in card["elements"] if e.get("text"))
+    assert "**" in content                              # lark_md 真加粗
+    assert "**二、用户行为聚类结果**" in content
+    assert "初步推进建议" in content and "必须重视" in content
+    assert any(e["tag"] == "hr" for e in card["elements"])
+
+
+def test_suggestions_name_actions_and_stakeholders():
+    digest = {"rows": [
+        {"label": "高频套利者", "n": 8, "pct": 0.4, "churn_rate": 0.5, "freq": 1.0,
+         "holding": 4.0, "protocols": 2.0, "gas_ratio": 0.9, "balance": -3.0, "idle_days": 60.0},
+        {"label": "长期持有者", "n": 6, "pct": 0.3, "churn_rate": 0.9, "freq": 0.5,
+         "holding": 30.0, "protocols": 5.0, "gas_ratio": 0.1, "balance": 2.0, "idle_days": 5.0}],
+        "n_addresses": 20, "n_personas": 2, "n_noise": 0, "risk_ratio": 0.4}
+    tips = notify.build_suggestions({"horizon": 30}, digest, _fake_status(ok=False),
+                                    notify.risk_level(0.70))
+    joined = " ".join(tips)
+    assert "先修数据管道" in joined                    # 运行失败 → 先修管道
+    assert "主攻「高频套利者」" in joined and "增长 / 运营" in joined
+    assert "守住基本盘" in joined and "长期持有者" in joined
+    assert "Etherscan" in joined and "数据/平台工程" in joined
+
+
+def test_status_page_writes_html(tmp_path, monkeypatch):
+    from src import status_page
+    monkeypatch.setattr(status_page.config, "STATUS_PAGE", tmp_path / "status.html")
+    path = status_page.build_status_page(
+        {"forecast_churn_rate": 0.62, "high_risk_ratio": 0.4, "horizon": 30},
+        digest=notify.collect_cluster_digest(tmp_path / "nope.db"),
+        status=_fake_status(), email_ok=True, lark_ok=True,
+        n_addresses=2000, n_transactions=12000)
+    text = path.read_text(encoding="utf-8")
+    assert "运行状态" in text and "三个方向的入口与结果" in text
+    assert "初步推进建议" in text and "http://localhost:8501" in text
+    assert "2000 / 12000" in text
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

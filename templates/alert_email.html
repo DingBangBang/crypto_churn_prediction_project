@@ -16,6 +16,15 @@
             <div style="font-size:13px;color:#e0e7ff;margin-top:8px;">生成时间：{{generated_at}}</div>
           </td>
         </tr>
+        <!-- 运行状态 + 风险等级 -->
+        <tr><td style="padding:22px 32px 0;">
+          <div style="background:#f8fafc;border:1px solid #e2e8f0;border-left:4px solid #4f46e5;border-radius:10px;padding:14px;font-size:13px;line-height:1.75;color:#334155;">
+            {{run_status_text}}
+          </div>
+          <div style="margin-top:12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:12px 14px;font-size:14px;font-weight:600;color:#9a3412;">
+            风险等级：{{risk_level_text}}
+          </div>
+        </td></tr>
         <!-- Summary cards -->
         <tr><td style="padding:26px 32px 6px;">
           <div style="font-size:16px;font-weight:700;margin-bottom:14px;">核心风险指标</div>
@@ -52,6 +61,13 @@
             {{trigger_reasons}}
           </div>
         </td></tr>
+        <!-- 多时间窗预测 -->
+        <tr><td style="padding:18px 32px 6px;">
+          <div style="font-size:16px;font-weight:700;margin-bottom:10px;">多时间窗流失率预测（1 / 7 / 14 / 30 / 90 天）</div>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:14px;border-collapse:collapse;">
+            {{horizon_table_rows}}
+          </table>
+        </td></tr>
         <!-- Table -->
         <tr><td style="padding:18px 32px 6px;">
           <div style="font-size:16px;font-weight:700;margin-bottom:10px;">风险概览</div>
@@ -62,6 +78,13 @@
             </tr>
             {{detail_rows}}
           </table>
+        </td></tr>
+        <!-- 初步推进建议 -->
+        <tr><td style="padding:18px 32px 6px;">
+          <div style="font-size:16px;font-weight:700;margin-bottom:10px;">初步推进建议（模板规则生成，非大模型）</div>
+          <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:14px;font-size:14px;line-height:1.8;color:#166534;">
+            {{suggestions_html}}
+          </div>
         </td></tr>
         <!-- CTA -->
         <tr><td style="padding:22px 32px 8px;" align="center">

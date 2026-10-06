@@ -222,8 +222,17 @@ def _forecast_one(series: np.ndarray, horizon: int) -> np.ndarray:
 
 
 def forecast_frequencies(df: pd.DataFrame, model) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float]]:
-    """ARIMA-forecast daily frequency for each address and roll up per-day stats."""
-    horizon = config.FORECAST_HORIZON_DAYS
+    """ARIMA-forecast daily frequency for each address and roll up per-day stats.
+
+    The ARIMA is fitted **once** up to ``config.FORECAST_MAX_DAYS`` (90 by default) so a
+    single fit can report several forecast windows (1 / 7 / 14 / 30 / 90 天); the
+    ``FORECAST_HORIZON_DAYS`` window (30 天) stays the canonical one used by the alert
+    thresholds, the charts and the ``forecast_daily`` table.
+    """
+    horizon = config.FORECAST_HORIZON_DAYS          # 主窗口（默认 30 天）
+    horizons = config.FORECAST_HORIZONS             # 全部窗口，默认 [1, 7, 14, 30, 90]
+    fit_horizon = max(config.FORECAST_MAX_DAYS, horizon)
+    main = min(horizon, fit_horizon)                # 主窗口切片长度
     conn = db.connect()
     try:
         row = conn.execute("SELECT MAX(timestamp) FROM raw_transactions").fetchone()
@@ -233,16 +242,16 @@ def forecast_frequencies(df: pd.DataFrame, model) -> Tuple[pd.DataFrame, pd.Data
         conn.close()
 
     addrs = df["address"].tolist()
-    F = np.zeros((len(addrs), horizon), dtype=float)
+    F = np.zeros((len(addrs), fit_horizon), dtype=float)
     for i, addr in enumerate(addrs):
         series = series_map.get(addr)
         if series is None or len(series) == 0:
             F[i, :] = df["tx_freq_daily"].iloc[i]
         else:
-            F[i, :] = _forecast_one(series, horizon)
+            F[i, :] = _forecast_one(series, fit_horizon)
 
     current = df["tx_freq_daily"].to_numpy(dtype=float)
-    forecast_freq = F.mean(axis=1)
+    forecast_freq = F[:, :main].mean(axis=1)
     freq_drop = current - forecast_freq
 
     proba = np.full(len(addrs), np.nan)
@@ -276,7 +285,7 @@ def forecast_frequencies(df: pd.DataFrame, model) -> Tuple[pd.DataFrame, pd.Data
 
     current_mean = float(current.mean())
     daily_rows = []
-    for d in range(horizon):
+    for d in range(main):
         day_freq = F[:, d]
         daily_rows.append({
             "day_index": d + 1,
@@ -286,8 +295,27 @@ def forecast_frequencies(df: pd.DataFrame, model) -> Tuple[pd.DataFrame, pd.Data
         })
     daily_df = pd.DataFrame(daily_rows)
 
+    # 多时间窗（1/7/14/30/90 天）：同一份 ARIMA 结果上的累积窗口口径
+    #   churn_rate            = 该窗口内「平均频次已低于 CHURN_FREQ_EPS」的地址占比
+    #   final_day_churn_rate  = 该窗口最后一天「当天频次低于 CHURN_FREQ_EPS」的地址占比
+    horizon_forecasts: Dict[str, Dict[str, float]] = {}
+    for h in horizons:
+        hh = min(int(h), fit_horizon)
+        if hh <= 0:
+            continue
+        freq_h = F[:, :hh].mean(axis=1)
+        horizon_forecasts[str(int(h))] = {
+            "horizon": int(h),
+            "avg_daily_freq": round(float(freq_h.mean()), 4),
+            "freq_drop": round(float((current - freq_h).mean()), 4),
+            "churn_rate": round(float((freq_h <= CHURN_FREQ_EPS).mean()), 4),
+            "final_day_churn_rate": round(float((F[:, hh - 1] <= CHURN_FREQ_EPS).mean()), 4),
+        }
+
     summary = {
         "horizon": horizon,
+        "horizons": list(horizons),
+        "horizon_forecasts": horizon_forecasts,
         "current_mean_freq": round(current_mean, 4),
         "forecast_mean_freq": round(float(forecast_freq.mean()), 4),
         "final_day_freq": daily_df["avg_daily_freq"].iloc[-1],
@@ -358,6 +386,17 @@ def build_insight_text(metrics_df, importance, freq_agg, summary, forecast_df,
     lines.append(f"- 第 30 天累计流失率: {summary['final_day_churn_rate']:.2%}")
     lines.append(f"- 人均交易频次降低值: {summary['avg_freq_drop']}")
     lines.append(f"- 高危地址占比: {summary['high_risk_ratio']:.2%}")
+    horizons = summary.get("horizon_forecasts") or {}
+    if horizons:
+        lines.append("")
+        lines.append("### 多时间窗流失率预测 (1/7/14/30/90 天)")
+        for key in sorted(horizons, key=lambda k: int(k)):
+            h = horizons[key]
+            lines.append(
+                f"- **{h['horizon']} 天**: 预测流失率 {h['churn_rate']:.1%}"
+                f"（末日均频 {h['avg_daily_freq']}，较当前降 {h['freq_drop']}）")
+        lines.append("- 说明：同一份 ARIMA 拟合按不同窗口累积统计；窗口越长，"
+                     "「持续低频」的地址占比越高，是自然衰减，重点看短窗（1/7 天）是否急速抬头。")
     lines.append("")
     lines.append("### 结论")
     lines.append(
