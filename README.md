@@ -221,12 +221,20 @@ SMTP_HOST=smtp.gmail.com
 SMTP_PORT=465
 SMTP_USER=dingbangchu@gmail.com
 SMTP_PASS=你的Gmail应用专用密码
+# 国内网络常阻断 SMTP 出站（TCP 可连、TLS 握手挂死），填本地代理后邮件走隧道发送
+SMTP_PROXY=http://127.0.0.1:7897
 ALERT_EMAIL_TO=dingbangchu@gmail.com
 LARK_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/xxxx
 LARK_AT_PHONE=13339947334
 ALERT_CHURN_RATE_THRESHOLD=0.40
 ALERT_RISK_CLUSTER_RATIO=0.25
 ```
+
+> ⚠️ **两个常见坑**（均已实测踩过）：
+> 1. `SMTP_PASS` 必须是 Gmail 的 **16 位应用专用密码**（<https://myaccount.google.com/apppasswords>），
+>    用账号登录密码会收到 `535 BadCredentials`，且 Gmail 会在首次拒绝后断开连接。
+> 2. 国内网络下 `smtp.gmail.com` 常常**TCP 能连但 TLS 握手挂死**（`openssl s_client` 直接无响应）。
+>    填上 `SMTP_PROXY`（如 Clash 的 `http://127.0.0.1:7897`）后走代理隧道即可正常握手收发。
 
 手动测试告警渲染与发送：
 

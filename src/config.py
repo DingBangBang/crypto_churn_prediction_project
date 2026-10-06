@@ -154,6 +154,9 @@ SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = _get_int("SMTP_PORT", 465)
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
+# 本地/国内网络常对 SMTP 出站做阻断（TCP 可连、TLS 握手挂死）。
+# 填上本地代理（如 Clash 混合端口 http://127.0.0.1:7897）即可让邮件走代理隧道发出。
+SMTP_PROXY = os.getenv("SMTP_PROXY", "")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "dingbangchu@gmail.com")
 LARK_WEBHOOK_URL = os.getenv("LARK_WEBHOOK_URL", "")
 LARK_AT_PHONE = os.getenv("LARK_AT_PHONE", "13339947334")

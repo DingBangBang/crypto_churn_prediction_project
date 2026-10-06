@@ -19,10 +19,12 @@ from __future__ import annotations
 import json
 import logging
 import smtplib
+import socket
 import ssl
 import subprocess
 import sys
 import time
+import urllib.parse
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -63,6 +65,44 @@ def _detail_rows(items: List[Tuple[str, str]]) -> str:
 
 
 # --- channels -----------------------------------------------------------------
+def _proxy_tunnel(host: str, port: int, proxy_url: str, timeout: int = 20) -> socket.socket:
+    """Open a raw TCP socket to ``host:port`` through an HTTP proxy (CONNECT).
+
+    Needed on networks that let TCP connect but silently drop the SMTP TLS
+    handshake (measured on a CN residential line: ``openssl s_client`` to
+    smtp.gmail.com:465 hangs without a proxy, but completes with one).
+    """
+    if "//" not in proxy_url:
+        proxy_url = "http://" + proxy_url
+    parsed = urllib.parse.urlparse(proxy_url)
+    sock = socket.create_connection((parsed.hostname, parsed.port or 8080), timeout=timeout)
+    sock.sendall(
+        f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode()
+    )
+    banner = b""
+    while b"\r\n\r\n" not in banner:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise OSError("代理连接被关闭（CONNECT 无响应）")
+        banner += chunk
+    status = banner.split(b"\r\n", 1)[0].decode(errors="replace")
+    if " 200" not in status:
+        raise OSError(f"代理 CONNECT 失败: {status}")
+    return sock
+
+
+def _smtp_ssl_via_proxy(context: ssl.SSLContext, timeout: int = 20):
+    """Return a connected ``SMTP_SSL`` client whose socket rides the proxy tunnel."""
+    raw = _proxy_tunnel(config.SMTP_HOST, config.SMTP_PORT, config.SMTP_PROXY, timeout)
+    server = smtplib.SMTP_SSL(context=context, timeout=timeout)
+    server.sock = context.wrap_socket(raw, server_hostname=config.SMTP_HOST)
+    server.file = server.sock.makefile("rb")
+    code, msg = server.getreply()          # SMTP greeting (220)
+    if code != 220:
+        raise smtplib.SMTPException(f"SMTP 问候异常: {code} {msg}")
+    return server
+
+
 def send_email(subject: str, html_body: str, to: str | None = None) -> bool:
     to = to or config.ALERT_EMAIL_TO
     if not (config.SMTP_USER and config.SMTP_PASS):
@@ -75,11 +115,33 @@ def send_email(subject: str, html_body: str, to: str | None = None) -> bool:
     msg.attach(MIMEText(html_body, "html", "utf-8"))
     try:
         ctx = ssl.create_default_context()
-        with smtplib.SMTP_SSL(config.SMTP_HOST, config.SMTP_PORT, context=ctx, timeout=20) as server:
+        if config.SMTP_PROXY:
+            server = _smtp_ssl_via_proxy(ctx)
+            logger.info("邮件经代理隧道连接: %s", config.SMTP_PROXY)
+        else:
+            server = smtplib.SMTP_SSL(config.SMTP_HOST, config.SMTP_PORT,
+                                      context=ctx, timeout=20)
+        try:
+            server.ehlo()
+            # Gmail 同时支持 LOGIN/PLAIN/XOAUTH2。若密码错误，smtplib 会换下一种机制重试，
+            # 而 Gmail 在首次拒绝后直接断连，真实的 "535 BadCredentials" 就被换成了一句
+            # 费解的 "Connection unexpectedly closed"。锁死为 PLAIN，让报错保持可读。
+            if server.esmtp_features.get("auth"):
+                server.esmtp_features["auth"] = "PLAIN"
             server.login(config.SMTP_USER, config.SMTP_PASS)
             server.sendmail(config.SMTP_USER, [to], msg.as_string())
+        finally:
+            server.close()
         logger.info("预警邮件已发送 -> %s", to)
         return True
+    except smtplib.SMTPAuthenticationError as exc:
+        detail = exc.smtp_error
+        detail = detail.decode(errors="replace") if isinstance(detail, bytes) else str(detail)
+        logger.error("邮件发送失败：SMTP 认证被拒 -> %s\n"
+                     "  · Gmail 必须使用 16 位【应用专用密码】(https://myaccount.google.com/apppasswords)，"
+                     "不是账号登录密码；\n"
+                     "  · 若确认密码正确，请检查 SMTP_PROXY 是否可用。", detail.strip())
+        return False
     except Exception as exc:  # pragma: no cover - depends on external SMTP
         logger.error("邮件发送失败: %s", exc)
         return False

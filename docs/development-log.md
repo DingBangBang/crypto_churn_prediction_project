@@ -121,6 +121,35 @@
   满足"一条命令跑完直接看结果"。
 - LightGBM 运行需 `libgomp1`，Dockerfile 中显式安装。
 
-## 8. 待办 / 未来可优化点
+## 8. 踩坑：预警邮件"发了但发不出去"（国内网络 + Gmail）
+
+现象：`python -m src.notify` 只报 `邮件发送失败: Connection unexpectedly closed`，
+既看不出是网络问题还是密码问题。
+
+排查路径（可复现）：
+
+1. `nc -vz smtp.gmail.com 465` → **success**；但 `openssl s_client -connect smtp.gmail.com:465`
+   直接卡死、无任何响应。说明 TCP SYN 是本地代理/网关代答的，**TLS 握手才是被阻断的那一环**
+   —— 别信 `nc` 的"端口通"。
+2. 加代理再握手：`openssl s_client -proxy 127.0.0.1:7897 -connect smtp.gmail.com:465` →
+   立刻成功（`CN=smtp.gmail.com` 证书链校验通过）。**结论：SMTP 必须走代理隧道**。
+3. 于是给 `src/notify.py` 加了 `_proxy_tunnel()`：纯标准库发 `CONNECT` 建隧道，再用 `ssl`
+   把裸 socket 包一层，塞进 `smtplib.SMTP_SSL` 的 `.sock` / `.file`。通道立刻打通：
+   `220 问候` → `EHLO 250` → `TLS_AES_256_GCM_SHA384`，全程 < 1 秒。
+4. 通道通了但认证仍失败，日志又是一句 `Connection unexpectedly closed`。用 `set_debuglevel(1)`
+   看原始协议才发现真相：smtplib 先用 `AUTH PLAIN`，被 Gmail 回 **535 BadCredentials**，
+   它**自动换 `AUTH LOGIN` 重试**，Gmail 随即掐断连接 —— 真正可读的 535 被替换成了断连异常。
+   修法：`login()` 之前把 `server.esmtp_features["auth"]` 锁成 `PLAIN`（只试一种机制），
+   让报错保持为清晰的 535；同时单独捕获 `SMTPAuthenticationError` 打印可操作提示。
+
+**两条教训**
+- `nc -vz` 通 ≠ 端口可用：有本地代理/透明网关时 SYN 由代理代答，必须做一次**真实 TLS 握手**才算数。
+- 第三方库的"友好重试"会吃掉真正的错误信息；排查这类协议问题，`set_debuglevel(1)`
+  看原始交互比读异常消息快得多。
+
+配置要点：`SMTP_PASS` 必须是 16 位**应用专用密码**（不是账号登录密码）；
+`SMTP_PROXY=http://127.0.0.1:7897`（Clash 混合端口）用于穿透出站阻断。
+
+## 9. 待办 / 未来可优化点
 
 见 README 的「未来可优化点」章节（多链支持、图神经网络、增量特征、模型监控等）。
