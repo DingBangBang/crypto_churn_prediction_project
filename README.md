@@ -700,7 +700,7 @@ docker push bonnie333333333/crypto-churn-prediction:latest
 | --- | --- | --- |
 | **LLM 生成「初步推进建议」** | 当前为**模板规则**（`build_suggestions()`），零成本、可审计 | 把「运行状态 + 1/7/14/30/90 天预测 + 簇画像 + SHAP Top 特征」组装成结构化上下文，交给**公司内部 LLM 网关（OEM / LOOM）**或本地 Qwen/DeepSeek 生成更贴合业务的建议；保留模板结果作为 **fallback** 与对照，避免幻觉直接进业务群。已在配置里预留思路：以环境变量切换 `模板 / LLM / 两者对比` |
 | **全量 12000 节点** | 本机只跑 **2000 个地址**做链路验证（免费 Etherscan Key 限流，2000 ≈ 数小时） | 接入**公司内部 Etherscan API / 自建归档节点**：`ADDRESS_LIMIT=12000`、`MONTHS_BACK=6`，同一套代码直接跑全量；再考虑按簇分层抽样以控制算力 |
-| **镜像分发** | `bonnie333333333/crypto-churn-prediction:latest`（1.63 GB）**已推送成功**：`digest sha256:8f1eed0b4b6b90402d5b9412e13ef625199e1d756f6571c4274875c26b84fd8d`，且严格控制在**5 分钟硬上限**内（`timeout 300 docker push`，超时即放弃） | 受限网络下多次超时 → 现改为硬上限 + 分层续传；公司内网可改推 Harbor 更稳 |
+| **镜像分发** | `bonnie333333333/crypto-churn-prediction:latest`（1.63 GB）**已推送成功**：`digest sha256:8f1eed0b4b6b90402d5b9412e13ef625199e1d756f6571c4274875c26b84fd8d`，且严格控制在**5 分钟硬上限**内（`timeout 300 docker push`，超时即放弃） | 受限网络下多次超时 → 现改为硬上限 + 分层续传；公司内网可改推 Harbor 更稳。**注意**：之后每次本地 `docker compose up -d --build` 会把同名 `:latest` 打回**新构建**（本次重建后本地为 `5a12c5e41d36`，含进度层 + 看板口径自检；上面的 digest 是更早一次推送的产物），需要同步远端时在合适网络窗口再 `docker push` |
 | **多链 / 图模型 / 增量特征** | 未做 | 见上一节「未来可优化点」1–8 条 |
 
 | 维度 | 🐋 Whale-alert-system（参考项目） | 🪙 本项目 |

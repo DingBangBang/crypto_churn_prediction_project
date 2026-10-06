@@ -3,8 +3,8 @@
 # 一键启动（宿主机入口）：构建镜像 -> 后台起容器 -> **实时把容器里的进度流到本终端** ->
 # 等看板就绪 -> 自动打开「运行状态页 + 看板」-> 打印四去向链接清单。
 #
-#   ./start.sh                       # 默认（首启 ADDRESS_LIMIT=200，几分钟）
-#   ADDRESS_LIMIT=2000 ./start.sh    # 全量验证（数小时；进度条会一直走）
+#   ./start.sh                       # 默认：ADDRESS_LIMIT 默认 2000（全量）；已跑过则直接秒起看板
+#   ADDRESS_LIMIT=200 ./start.sh     # 200 地址快速演示（测试模式，产物带 _test 后缀）
 #   RUN_DELIVER=0 ./start.sh         # 只跑流水线，不交付邮件/Lark/状态页
 #   NO_OPEN=1 ./start.sh             # 不自动打开浏览器（CI / 远程终端）
 #   FORCE_PIPELINE=1 ./start.sh      # 忽略 marker，强制重跑整条流水线
@@ -39,7 +39,7 @@ trap cleanup EXIT
 echo "============================================================"
 echo " 🪙 加密货币用户行为聚类分析与流失预测 · 一键启动"
 echo " 步骤：构建镜像 → 抓取 → 特征 → 聚类 → 预测 → 交付四去向 → 看板"
-echo " 地址数 ADDRESS_LIMIT=${ADDRESS_LIMIT:-200}（environment.env 里的值优先）"
+echo " 地址数 ADDRESS_LIMIT=${ADDRESS_LIMIT:-2000}（environment.env 里的值优先；environment: 会覆盖 env_file）"
 echo "============================================================"
 
 echo "==> [1/4] 构建镜像并启动容器：docker compose up -d --build"
