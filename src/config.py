@@ -268,3 +268,62 @@ GMAIL_REDIRECT_URI = os.getenv("GMAIL_REDIRECT_URI", "http://localhost:8765/")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://localhost:8501")
 # 「运行状态页」：macOS 通知点开后展示运行状态 + 邮件/Lark/看板三方向链接与结果内容
 STATUS_PAGE = REPORTS_DIR / "status.html"
+
+
+# --- 口径一致性自检（看板 / 交付环节用）---------------------------------------
+# 为什么需要：ADDRESS_LIMIT / TEST_MODE / DB_PATH 都是**导入时**求值的模块常量。长驻进程
+# （Streamlit 看板）即使 ``st.cache_data(ttl=60)`` 过期，也只会用旧常量去读 `_test` 那套
+# 200 地址的库 —— 表现为「看板永远不更新，还是测试结果」。这里提供运行期的交叉校验，把
+# 「进程口径 vs 磁盘数据 vs 配置文件」的不一致显式暴露出来（看板渲染成顶部红条）。
+def read_env_file_limit() -> int | None:
+    """从 env 文件里直接读 ``ADDRESS_LIMIT``（不依赖启动时冻结的 ``os.environ``）。"""
+    for path in _CANDIDATE_ENV_FILES:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line.startswith("ADDRESS_LIMIT="):
+                try:
+                    return int(line.split("=", 1)[1].strip().strip('"').strip("'"))
+                except ValueError:
+                    return None
+    return None
+
+
+def feature_rows(db_name: str) -> int:
+    """``data/<db_name>`` 里的特征地址数；库不存在或读不动返回 0。"""
+    import sqlite3
+
+    path = DATA_DIR / db_name
+    if not path.exists():
+        return 0
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM address_features").fetchone()[0])
+        finally:
+            conn.close()
+    except Exception:
+        return 0
+
+
+def data_mode_drift_notice() -> str | None:
+    """本进程口径与磁盘数据 / 配置文件不一致时给出提示文案，一致则 ``None``。"""
+    full_rows = feature_rows("crypto_churn.db")
+    test_rows = feature_rows("crypto_churn_test.db")
+    file_limit = read_env_file_limit()
+    restart = ("重启看板即可切换：容器 `docker compose restart churn-app`；"
+               "宿主机 `pkill -f 'streamlit run app/dashboard.py'` 后用新口径重新运行。")
+    if TEST_MODE and full_rows > 200:
+        return (f"⚠️ **看板口径与数据不一致**：本进程按**测试口径**启动"
+                f"（ADDRESS_LIMIT={ADDRESS_LIMIT}，正在读 `{Path(DB_PATH).name}` = {test_rows} 个地址），"
+                f"但磁盘上已有**全量数据** `crypto_churn.db` = **{full_rows}** 个地址。"
+                f"进程启动早于最后一次全量运行，模块常量不会热更新。{restart}")
+    if file_limit is not None and file_limit != ADDRESS_LIMIT:
+        return (f"⚠️ **env 文件改了但看板未重启**：文件里是 `ADDRESS_LIMIT={file_limit}`，"
+                f"本进程启动时读到的是 `{ADDRESS_LIMIT}`。{restart}")
+    if not TEST_MODE and full_rows == 0 and test_rows > 0:
+        return (f"⚠️ 本进程按**全量口径**启动，但只找到测试库 `crypto_churn_test.db`"
+                f"（{test_rows} 个地址），没有 `crypto_churn.db`。请先跑一次全量流水线"
+                f"（`ADDRESS_LIMIT=2000 python scripts/run_pipeline.py`）。")
+    return None

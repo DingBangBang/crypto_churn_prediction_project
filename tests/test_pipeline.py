@@ -581,6 +581,76 @@ def test_smtp_proxy_reuses_fetch_proxy_unless_direct(monkeypatch):
     importlib.reload(config)                 # 重新读回 environment.env，别影响后续用例
 
 
+def _make_features_db(path: Path, rows: int) -> None:
+    """造一个只含 address_features 的最小库，用来模拟 200 / 全量 两套数据。"""
+    import sqlite3
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE address_features (address TEXT)")
+    conn.executemany("INSERT INTO address_features VALUES (?)", [(f"0x{i}",) for i in range(rows)])
+    conn.commit()
+    conn.close()
+
+
+def _isolate_dashboard_scope(monkeypatch, tmp_path, *, limit: int, test_mode: bool,
+                             db_name: str, env_limit: int | None):
+    """把 config 的「口径 + 数据目录 + env 文件位置」都指到 tmp_path，隔离真实数据。"""
+    from src import config
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "ADDRESS_LIMIT", limit)
+    monkeypatch.setattr(config, "TEST_MODE", test_mode)
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / db_name))
+    env_file = tmp_path / "environment.env"
+    env_file.write_text("", encoding="utf-8")
+    if env_limit is not None:
+        env_file.write_text(f"ADDRESS_LIMIT={env_limit}\n", encoding="utf-8")
+    monkeypatch.setattr(config, "_CANDIDATE_ENV_FILES", [env_file])
+    return config
+
+
+def test_dashboard_drift_notice_flags_stale_test_scope(tmp_path, monkeypatch):
+    """本次真实踩的坑：看板进程按 200 测试口径启动，磁盘却已有 1940 行全量库 → 必须报红字。"""
+    _make_features_db(tmp_path / "crypto_churn.db", 1940)
+    _make_features_db(tmp_path / "crypto_churn_test.db", 200)
+    config = _isolate_dashboard_scope(monkeypatch, tmp_path, limit=200, test_mode=True,
+                                      db_name="crypto_churn_test.db", env_limit=200)
+
+    notice = config.data_mode_drift_notice()
+    assert notice and "看板口径与数据不一致" in notice
+    assert "1940" in notice and "crypto_churn_test.db" in notice
+    assert "重启看板" in notice
+
+
+def test_dashboard_drift_notice_flags_env_file_change(tmp_path, monkeypatch):
+    """environment.env 改成 2000、进程仍是 200 → 提示「未重启」（模块常量不热更新）。"""
+    config = _isolate_dashboard_scope(monkeypatch, tmp_path, limit=200, test_mode=True,
+                                      db_name="crypto_churn_test.db", env_limit=2000)
+    notice = config.data_mode_drift_notice()
+    assert notice and "env 文件改了但看板未重启" in notice and "ADDRESS_LIMIT=2000" in notice
+
+
+def test_dashboard_drift_notice_silent_when_scope_matches_data(tmp_path, monkeypatch):
+    """口径与数据一致（全量模式 + 全量库）时不该打扰用户。"""
+    _make_features_db(tmp_path / "crypto_churn.db", 1940)
+    config = _isolate_dashboard_scope(monkeypatch, tmp_path, limit=2000, test_mode=False,
+                                      db_name="crypto_churn.db", env_limit=2000)
+    assert config.data_mode_drift_notice() is None
+
+
+def test_dashboard_drift_notice_flags_missing_full_db(tmp_path, monkeypatch):
+    """按全量口径启动却只有测试库 → 提示先跑全量流水线。"""
+    _make_features_db(tmp_path / "crypto_churn_test.db", 200)
+    config = _isolate_dashboard_scope(monkeypatch, tmp_path, limit=2000, test_mode=False,
+                                      db_name="crypto_churn.db", env_limit=2000)
+    notice = config.data_mode_drift_notice()
+    assert notice and "全量口径" in notice and "200" in notice
+
+
+def test_read_env_file_limit_missing_file_is_none(tmp_path, monkeypatch):
+    from src import config
+    monkeypatch.setattr(config, "_CANDIDATE_ENV_FILES", [tmp_path / "nope.env"])
+    assert config.read_env_file_limit() is None
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

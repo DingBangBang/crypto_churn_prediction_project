@@ -29,8 +29,12 @@ services:
       - path: ".env"
         required: false
     environment:
-      # 首启抓取多少地址：200 = 快速演示；改为 2000 = 全量。
-      ADDRESS_LIMIT: "${ADDRESS_LIMIT:-200}"
+      # 口径优先级（**重要**）：`environment:` 会覆盖上面 env_file 里的同名键，所以这里
+      # 只是「外壳没导出 ADDRESS_LIMIT 时」的默认值 —— 默认 2000，与本机全量验证口径一致。
+      #   * 快速演示（测试模式，产物带 _test 后缀）：ADDRESS_LIMIT=200 ./start.sh
+      #   * 若 environment.env 写 2000、这里却留 200，容器会**静默退化成**只读测试库
+      #     （data/crypto_churn_test.db，200 地址）—— 看板看起来"没更新"，就是这个坑。
+      ADDRESS_LIMIT: "${ADDRESS_LIMIT:-2000}"
       CHAIN_ID: "${CHAIN_ID:-1}"
       CHURN_DB_PATH: "/app/data/crypto_churn.db"
       DASHBOARD_URL: "http://localhost:8501"

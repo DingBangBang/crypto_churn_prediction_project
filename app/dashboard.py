@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -31,6 +32,14 @@ if str(ROOT) not in sys.path:
 from src import config  # noqa: E402
 
 st.set_page_config(page_title="加密用户行为聚类 & 流失预测", page_icon="🪙", layout="wide")
+
+
+# --- 数据口径一致性自检 --------------------------------------------------------
+# ``config`` 里的 ADDRESS_LIMIT / TEST_MODE / DB_PATH 在**进程启动时**就被冻结，
+# ``st.cache_data(ttl=60)`` 只让查询缓存过期、改不了这些常量。于是若看板进程启动得比
+# 最后一次全量运行还早，它会一直安静地读 `_test` 那套 **200 地址** 的库 —— 表现就是
+# 「看板永远不更新」。自检逻辑住在 ``src.config.data_mode_drift_notice()``（可单测），
+# 这里只负责把它渲染成顶部红条 + 一条可复制的重启命令。
 
 
 @st.cache_data(ttl=60)
@@ -71,8 +80,21 @@ fs = summary.get("forecast_summary", {})
 
 # --- header -------------------------------------------------------------------
 st.title("🪙 加密货币用户行为聚类分析与流失预测")
-mode = "🧪 测试模式 (200 地址)" if config.TEST_MODE else "🚀 全量模式 (2000 地址)"
-st.caption(f"{mode} ｜ 数据库 `{config.DB_PATH}` ｜ 参考时间基准=数据集最新时间戳")
+mode = (
+    f"🧪 测试模式（ADDRESS_LIMIT={config.ADDRESS_LIMIT}，产物带 `_test` 后缀）"
+    if config.TEST_MODE
+    else f"🚀 全量模式（ADDRESS_LIMIT={config.ADDRESS_LIMIT}）"
+)
+_db_path = Path(config.DB_PATH)
+_db_mtime = _db_path.stat().st_mtime if _db_path.exists() else 0
+_drift = config.data_mode_drift_notice()
+if _drift:
+    st.error(_drift)
+st.caption(
+    f"{mode} ｜ 数据库 `{_db_path.name}`（{len(feats):,} 行特征"
+    + (f"，库更新于 {time.strftime('%m-%d %H:%M', time.localtime(_db_mtime))}" if _db_mtime else "")
+    + "）｜ 参考时间基准=数据集最新时间戳"
+)
 
 with st.sidebar:
     st.header("⚙️ 控制台")
@@ -80,9 +102,11 @@ with st.sidebar:
     st.write(f"流失判定：`last_tx_days_ago > {config.CHURN_DAYS}` 天")
     st.write(f"预警阈值：流失率 ≥ `{config.ALERT_CHURN_RATE_THRESHOLD:.0%}`")
     st.write(f"高危簇阈值：`{config.ALERT_RISK_CLUSTER_RATIO:.0%}`")
-    if st.button("🔄 刷新缓存"):
+    if st.button("🔄 刷新数据缓存"):
         st.cache_data.clear()
         st.rerun()
+    st.caption("只清查询缓存；`ADDRESS_LIMIT`/`TEST_MODE`/库路径是**启动时**读入的模块常量，"
+               "改完 `environment.env` 必须**重启看板**才生效。")
     st.divider()
     st.write("**数据资产**")
     st.write(f"原始交易：`{len(raw):,}`")

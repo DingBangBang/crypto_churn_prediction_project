@@ -202,7 +202,8 @@ data_fetcher → feature_engineer → cluster_analyzer → churn_model
 
 - 只想要数据、不想推送：`RUN_DELIVER=0 ./start.sh`
 - 不想自动开浏览器（CI / 远程终端）：`NO_OPEN=1 ./start.sh`
-- 想要 2000 个地址的全量验证：`ADDRESS_LIMIT=2000 ./start.sh`
+- 只跑 200 地址的**快速演示**（测试模式，产物带 `_test` 后缀）：`ADDRESS_LIMIT=200 ./start.sh`
+  （默认口径是 2000 全量；注意 `environment:` 里的 `ADDRESS_LIMIT` **覆盖** `env_file`）
 - 容器内若想手动补发一次：`docker compose exec churn-app python scripts/daily_run.py --deliver-only`
 - 停止：`docker compose down`（数据留在 `./data`、报告留在 `./reports`）
 
@@ -428,6 +429,25 @@ python scripts/daily_run.py --deliver-only
 > **自动打开是怎么做的**：macOS 上优先用 `/usr/bin/open`（LaunchServices，不依赖「自动化」授权），
 > 失败再退 `open -a "Google Chrome"`，最后才用 Python `webbrowser`（osascript）；每次都打印
 > **实际命中的方式**，全失败则打印可手动访问的链接。自检：`python -m src.notify --open-test`。
+
+#### 4️⃣ 打开的看板还是「200 节点测试版」？（口径自检）
+
+看板进程会把 `ADDRESS_LIMIT / 测试模式 / 数据库路径` **在启动那一刻冻结**（`src/config.py` 的模块常量），
+而 `st.cache_data(ttl=60)` 只清「查询缓存」、改不了这些常量。所以 **改完 `environment.env`（200 → 2000）
+必须重启看板**，否则页面会安静地继续读 `_test` 那套 200 地址的数据 —— 邮件/Lark 里的链接、以及
+<http://localhost:8501> 看起来就"全都没更新"。
+
+- 看板会**自己报警**：口径与磁盘数据不一致时，标题下方直接显示**红条**，点名
+  「正在读 `crypto_churn_test.db` = 200 个地址，但磁盘已有全量 `crypto_churn.db` = 1940 个地址」，
+  并给出重启命令；标题 caption 常显「库名 + **特征行数** + 库更新时间」，一眼看出看的是哪份数据。
+- 重启看板：容器 `docker compose restart churn-app`；宿主机
+  `pkill -f 'streamlit run app/dashboard.py'` 后按新口径重新运行。
+- 命令行自查：`python -c "from src import config; print(config.data_mode_drift_notice())"`
+  （打印 `None` 即口径与数据一致）。
+
+> **为什么 Docker Desktop 里看不到本项目的容器 / 8501 端口？** 只有用 `./start.sh`（或
+> `docker compose up`）启动过，Docker Desktop 里才会有 `crypto-churn-app` 容器与 `8501` 端口映射；
+> 若你走的是**方式 C（宿主机 conda）**，那 8501 只是一个普通 Python 进程，Docker Desktop 里自然没有它。
 
 Lark 卡片由 `build_digest_card()` 生成、纯文本由 `build_digest_text()` 生成，实测样例
 （`python -m src.notify --preview` 或 `python -m src.notify`）：

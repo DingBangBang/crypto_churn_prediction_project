@@ -494,9 +494,56 @@
 - **验证**：`pytest` 35 passed（含 `test_progress_bar_formats_percentage_and_width`）；
   本机 `python -m src.notify --open-test` 与阶段化 dry-run 均按预期打印。
 
----
+### 21.5 看板「永远停在 200 节点测试版」：长驻进程冻结的 `config` 常量 + compose 键覆盖
 
-## 22. 待办 / 未来可优化点
+- **现象**：邮件里「打开实时看板」、Lark 卡片里的链接、以及 <http://localhost:8501> 三处**都还是
+  200 节点测试结果**，而流水线明明已按 `ADDRESS_LIMIT=2000` 跑完（`data/crypto_churn.db` = 1940 行）。
+  同时 Docker Desktop 里**看不到本项目容器、也看不到 8501 端口**。
+- **根因（三条，独立但同源）**：
+  1. **进程冻结（真凶）**：8501 是**宿主机**上 10-06 20:17 启动的一个
+     `streamlit run app/dashboard.py` 进程 —— 它启动时 `environment.env` 还是 `ADDRESS_LIMIT=200`。
+     `src/config.py` 的 `ADDRESS_LIMIT / TEST_MODE / DB_PATH` 是**导入时求值的模块常量**，进程一起
+     就不再变；`@st.cache_data(ttl=60)` 只能让「查询结果缓存」过期，**改不了常量** → 它一直读
+     `data/crypto_churn_test.db`（200 行）与 `_test` 产物。三个入口全都指向 8501，于是"全都没更新"。
+  2. **不是 Docker 的锅**：本次 2000 全量运行 + 看板都在**宿主机 conda 环境**里跑，从未对项目执行
+     `docker compose up`，所以 Docker Desktop 里只有别的项目（`whale-alert-system` 与
+     `whale-alert-system-incremental`、`monitoring-stack`），没有 `crypto-churn-app`。
+  3. **同款潜在坑**：`docker-compose.yml` 原写 `ADDRESS_LIMIT: "${ADDRESS_LIMIT:-200}"`，而 compose 的
+     `environment:` 会**覆盖** `env_file` —— 即便 `environment.env` 写了 2000，容器也会静默退回 200
+     的测试口径（同样表现为"看板还是测试版"）。
+- **修法**：
+  - `src/config.py` 新增 `read_env_file_limit() / feature_rows() / data_mode_drift_notice()`：在**运行期**
+    读真实 `environment.env` 与磁盘上的两个库做交叉校验（常量冻结了，就用文件 + 磁盘数据反推真相）；
+  - `app/dashboard.py` 把结果渲染成**顶部红条**：口径与数据不一致时直接点名
+    "正在读 `crypto_churn_test.db` = 200 个地址，磁盘已有全量 1940 个地址"并给出**可复制的重启命令**；
+    侧栏注明"改 `environment.env` 必须重启看板"；标题 caption 追加"库名 + 特征行数 + 库更新时间"，
+    让"看的是哪份数据"一眼可见；
+  - `scripts/daily_run.py` / `scripts/run_pipeline.py` 结束各加一行重启提醒（数据刚变时最需要）；
+  - `docker-compose.yml` 默认值改 `${ADDRESS_LIMIT:-2000}` 并写明覆盖关系（快速演示要显式
+    `ADDRESS_LIMIT=200 ./start.sh`）。
+- **验证**：`pytest` 40 passed（新增 5 条口径自检用例，含本次真实场景：测试口径 + 全量库存在 → 必须红字）。
+  真实演练 `ADDRESS_LIMIT=200 python -c "from src import config; print(config.data_mode_drift_notice())"`
+  → 输出"…`crypto_churn_test.db` = 200 个地址，但磁盘上已有**全量数据** `crypto_churn.db` = **1940** 个地址…"。
+- **运维教训**：**长驻进程的口径必须在界面上可见**。任何"改了配置却没重启"的服务，都该把
+  "我现在读的是哪份数据"直接印在界面上，而不是让用户去猜。
+
+### 21.6 Docker 重建卡在拉基础镜像：镜像加速源 EOF → 换源 + 本地打 tag
+
+- **现象**：`docker compose up -d --build` 失败：`failed to resolve source metadata for
+  docker.io/library/python:3.11-slim: ... Head "https://docker.mirrors.ustc.edu.cn/v2/...": EOF`。
+  本机只缓存了 `python:3.9-slim`，缺 3.11。
+- **修法**：不动 Docker Desktop 的守护进程配置（改 daemon.json 要重启 Desktop），而是**换可达镜像源
+  拉基础镜像再打回官方 tag**，让后续构建直接用本地层：
+  ```bash
+  docker pull docker.m.daocloud.io/library/python:3.11-slim
+  docker tag  docker.m.daocloud.io/library/python:3.11-slim python:3.11-slim
+  DOCKER_BUILDKIT=0 docker compose up -d --build      # 旧版构建器：优先用本地镜像，少一次元数据解析
+  ```
+  （备用源：`docker.1ms.run` / `hub.rat.dev` / `dockerproxy.net` → `/library/python:3.11-slim`。）
+- **教训**：受限网络下，**基础镜像先手动搞定**比反复重试 `--build` 更省时间；构建失败先看是不是
+  基础镜像/site-packages 的**下载**失败，与业务代码无关。
+
+
 
 见 README 的「未来可优化点」与「下一步优化」章节（LLM 生成建议、全量 12000 节点、
 多链支持、图神经网络、增量特征、模型监控等）。

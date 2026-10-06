@@ -59,6 +59,12 @@ def main(argv=None) -> int:
             out = deliver.deliver(fs, started=started, results=results,
                                   send=not args.no_send, open_when_done=open_when_done)
         logger.info("每日任务成功 -> %s", out["status_page"])
+        # 看板进程不会热更新口径（config 常量在启动时冻结）：数据刚变时主动提醒一次。
+        logger.info(
+            "提示：若看板页面仍显示旧数据，说明看板进程早于本次运行 —— "
+            "重启看板：容器 `docker compose restart churn-app` / "
+            "宿主机 `pkill -f 'streamlit run app/dashboard.py'` 后重新运行"
+        )
         return 0 if out["ok"] else 1
     except Exception as exc:  # noqa: BLE001
         reason = str(exc).strip() or exc.__class__.__name__

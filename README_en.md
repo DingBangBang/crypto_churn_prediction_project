@@ -211,7 +211,8 @@ point, the container runs `scripts/daily_run.py --deliver-only`, which reuses th
 
 - Data only, no pushing: `RUN_DELIVER=0 ./start.sh`
 - Don't auto-open a browser (CI / remote shell): `NO_OPEN=1 ./start.sh`
-- Full 2000-address validation: `ADDRESS_LIMIT=2000 ./start.sh`
+- Quick 200-address demo (test mode, `_test`-suffixed artefacts): `ADDRESS_LIMIT=200 ./start.sh`
+  (the default scope is the full 2000; note that `ADDRESS_LIMIT` under `environment:` **overrides** `env_file`)
 - Re-send once from inside the container: `docker compose exec churn-app python scripts/daily_run.py --deliver-only`
 - Stop: `docker compose down` (data stays in `./data`, reports in `./reports`)
 
@@ -455,6 +456,28 @@ python scripts/daily_run.py --deliver-only
 > **not** need the "Automation" permission), then `open -a "Google Chrome"`, and only then
 > Python's `webbrowser` (osascript). Every attempt prints **which strategy actually worked**; if
 > all fail it prints the copy-pasteable link. Self-check: `python -m src.notify --open-test`.
+
+#### 4️⃣ The dashboard still shows the 200-address *test* result? (scope self-check)
+
+A dashboard process freezes `ADDRESS_LIMIT / test mode / DB path` **at start-up** (they are module
+constants in `src/config.py`), while `st.cache_data(ttl=60)` only expires the *query* cache — it
+cannot change those constants. So **after editing `environment.env` (200 → 2000) you must restart the
+dashboard**, otherwise the page quietly keeps reading the `_test` dataset: the links inside the
+e-mail/Lark card and <http://localhost:8501> then all look "never updated".
+
+- The board **warns by itself**: when the process scope disagrees with the data on disk, a **red
+  banner** appears under the title, naming e.g. "reading `crypto_churn_test.db` = 200 addresses while
+  a full `crypto_churn.db` = 1940 addresses exists", plus the restart command. The caption always
+  shows "DB name + **feature rows** + DB mtime", so it is obvious which dataset you are looking at.
+- Restart it: container `docker compose restart churn-app`; on the host
+  `pkill -f 'streamlit run app/dashboard.py'` and start it again with the new scope.
+- CLI self-check: `python -c "from src import config; print(config.data_mode_drift_notice())"`
+  (`None` means scope and data agree).
+
+> **Why is there no container / port 8501 for this project in Docker Desktop?** Only if you started
+> it via `./start.sh` (or `docker compose up`) does Docker Desktop show `crypto-churn-app` with the
+> `8501` mapping. If you used **Option C (local conda)**, then 8501 is just a plain Python process
+> and Docker Desktop knows nothing about it.
 
 The card is built by `build_digest_card()`, the plain text by `build_digest_text()`. Real sample
 (`python -m src.notify --preview` or `python -m src.notify`) — the production copy is in Chinese
