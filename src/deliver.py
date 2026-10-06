@@ -30,7 +30,6 @@ import os
 import sqlite3
 import sys
 import time
-import webbrowser
 from pathlib import Path
 from typing import Any, Dict
 
@@ -88,7 +87,7 @@ def in_container() -> bool:
 
 
 def can_open_browser() -> bool:
-    """容器里没有 GUI（``open``/``webbrowser`` 都会静默失败），只在 macOS 宿主上打开。"""
+    """容器里没有 GUI（``open`` 会静默失败），只在 macOS 宿主上打开。"""
     return sys.platform == "darwin" and not in_container()
 
 
