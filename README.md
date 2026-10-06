@@ -205,41 +205,88 @@ cd ~/Desktop/crypto_churn_prediction_project && \
 
 ---
 
-## 🔔 预警邮件 + Lark 告警
+## 🔔 预警推送：邮件 + Lark（聚类结果 + 洞察）
 
-当**预测流失率 ≥ 40%** 或**高危占比 ≥ 25%** 时自动触发：
+两个通道由 `src/notify.py` 统一构建、分发：
 
-- **邮件**：`templates/alert_email.html`（HTML 模板，预留 `{{churn_rate}}` / `{{freq_drop}}` 等
-  占位符，按每次告警数值自动填空）→ 发送到 `ALERT_EMAIL_TO`。
-- **Lark（飞书）**：群机器人 webhook + `@` 指定手机号 `LARK_AT_PHONE`。
-- **macOS**：系统通知横幅。
+| 通道 | 推送内容 | 触发条件 |
+| --- | --- | --- |
+| **邮件** | HTML 卡片（`templates/alert_email.html` 占位符填空）→ `ALERT_EMAIL_TO` | 预测流失率 ≥ 40% 或高危占比 ≥ 25% |
+| **Lark / 飞书群机器人** | ① 流失预警（**预测时间窗 · 流失率预测 · 高危流失占比**）② **文字描述形式的用户行为聚类结果**（每簇规模、实际流失率、行为画像 + 业务解读）③ 从聚类与模型自动提炼的 **insights** | **每天例行推送**，不受阈值门控；阈值触发时预警段标 ⚠️ |
+| **macOS** | 系统通知横幅 | 同邮件 |
+
+Lark 消息由 `build_digest_text()` 生成，实测样例（`python -m src.notify`）：
+
+```text
+📮 加密用户行为聚类 & 流失预测 · 每日简报
+2026-10-06 20:22 ｜ 预测时间窗 30 天
+————————————
+一、流失预警（已触发 ⚠️）
+预测流失率（30 天）: 51.5%（阈值 40%）
+高危流失占比: 67.0%（阈值 25%）　高危行为簇占比: 52.0%
+人均日交易频次: 33.8058 → 第 30 天 19.2369（降幅 14.526）
+————————————
+二、【用户行为聚类结果】HDBSCAN · 4 类 + 96 个噪音点 · 覆盖 200 个地址
+⚠️ 噪音/机器人 · 96 个（48.0%）｜实际流失率 38.5% · 日均 67.10 笔 · …
+高频大户 · 55 个（27.5%）｜实际流失率 74.5% · 日均 4.23 笔 · 持仓 8.4h · …
+    └ 交易频繁、余额厚，是协议的核心用户
+长期持有者 · 31 个（15.5%）｜实际流失率 12.9% · …
+    └ 低频但持仓久，粘性最强、流失率最低
+————————————
+三、业务洞察（从聚类与模型自动提炼）
+· 驱动流失的关键特征 (SHAP)
+• total_tx: 平均 |SHAP| = 1.1441
+· 结论
+未来 30 天人均交易频次预计由 33.8058 降至 19.2369 …
+————————————
+看板: http://localhost:8501
+```
 
 在 `environment.env` 中配置：
 
 ```env
+# —— Lark（配好即可先跑起来）——
+LARK_WEBHOOK_URL=https://open.larksuite.com/open-apis/bot/v2/hook/xxxx
+# @ 只能填 Lark 的 open_id（ou_ 开头）；填手机号无法 @，代码会自动忽略
+LARK_AT_ID=ou_xxxxxxxxxxxxxxxx
+
+# —— 邮件方案 A（推荐）：Gmail API + OAuth2 ——
+GMAIL_CLIENT_ID=xxxx.apps.googleusercontent.com
+GMAIL_CLIENT_SECRET=xxxx
+GMAIL_REFRESH_TOKEN=        # 执行 python -m src.notify --oauth-login 自动获得
+
+# —— 邮件方案 B：SMTP + 应用专用密码（仅在账号仍可用时）——
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=465
 SMTP_USER=dingbangchu@gmail.com
 SMTP_PASS=你的Gmail应用专用密码
-# 国内网络常阻断 SMTP 出站（TCP 可连、TLS 握手挂死），填本地代理后邮件走隧道发送
-SMTP_PROXY=http://127.0.0.1:7897
 ALERT_EMAIL_TO=dingbangchu@gmail.com
-LARK_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/xxxx
-LARK_AT_PHONE=13339947334
+
+# 出站代理（邮件 / Google API 通用）：国内网络对 Google 系域名常做 TLS 层阻断
+NET_PROXY=http://127.0.0.1:7897
+SMTP_PROXY=http://127.0.0.1:7897
+
 ALERT_CHURN_RATE_THRESHOLD=0.40
 ALERT_RISK_CLUSTER_RATIO=0.25
 ```
 
-> ⚠️ **两个常见坑**（均已实测踩过）：
-> 1. `SMTP_PASS` 必须是 Gmail 的 **16 位应用专用密码**（<https://myaccount.google.com/apppasswords>），
->    用账号登录密码会收到 `535 BadCredentials`，且 Gmail 会在首次拒绝后断开连接。
-> 2. 国内网络下 `smtp.gmail.com` 常常**TCP 能连但 TLS 握手挂死**（`openssl s_client` 直接无响应）。
->    填上 `SMTP_PROXY`（如 Clash 的 `http://127.0.0.1:7897`）后走代理隧道即可正常握手收发。
+> ⚠️ **四个常见坑**（均已实测踩过，见 [docs/development-log.md](docs/development-log.md)）：
+> 1. **Google 已逐步下线「应用专用密码」**（<https://myaccount.google.com/apppasswords>），
+>    因此本项目支持改用 **Gmail API + OAuth2**（走 443，比 SMTP:465 更易穿透）。
+>    ⚠️ 注意：Google Cloud 里的 **API Key（`AIza...`）不能用来发信** —— 它只标识项目、
+>    不代表用户身份；发信需要 **OAuth 客户端 ID + 客户端密钥**（类型：桌面应用）+
+>    一次性授权换来的 **refresh token**。`python -m src.notify --oauth-login` 会帮你走完授权。
+> 2. `SMTP_PASS` 用账号登录密码会收到 `535 BadCredentials`，且 Gmail 在首次拒绝后立即断连。
+> 3. 国内网络下 `smtp.gmail.com` 常常**TCP 能连但 TLS 握手挂死**（`openssl s_client` 无响应）。
+>    填上 `NET_PROXY` / `SMTP_PROXY`（如 Clash 的 `http://127.0.0.1:7897`）走代理隧道即可。
+> 4. `smtplib` 会在 AUTH **PLAIN 失败后自动改用 LOGIN 重试**，把真实的 `535` 掩盖成
+>    「Connection unexpectedly closed」；本项目已锁死 `AUTH PLAIN` 让报错保持可读。
 
-手动测试告警渲染与发送：
+手动测试推送（用**最近一次真实预测结果**，不是假数字）：
 
 ```bash
-python -m src.notify     # 用示例数值发一封测试邮件/Lark
+python -m src.notify                # 发测试邮件 + Lark 简报（聚类结果 + 洞察）
+python -m src.notify --oauth-login  # 一次性 Google 授权，打印 GMAIL_REFRESH_TOKEN
 ```
 
 

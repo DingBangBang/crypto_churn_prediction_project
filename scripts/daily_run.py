@@ -128,7 +128,10 @@ def main(argv=None) -> int:
             conn.close()
         _write_snapshot(fs, risk_ratio)
 
-        triggered = notify.send_alerts(fs, risk_cluster_ratio=risk_ratio)
+        digest = notify.collect_cluster_digest()
+        triggered = notify.send_alerts(fs, risk_cluster_ratio=risk_ratio, digest=digest)
+        # 群机器人每天都要收到「聚类结果 + 洞察」，不受流失阈值门控。
+        lark_digest_ok = notify.send_lark_digest(fs, risk_ratio, digest=digest)
 
         ctx["ok"] = all(v[0] == "ok" for v in results.values())
         ctx["fields"] = {
@@ -140,6 +143,7 @@ def main(argv=None) -> int:
             "高危行为簇占比": f"{risk_ratio:.2%}",
             "人均频次降低值": fs.get("avg_freq_drop", "-"),
             "预警是否触发": "✅ 已发送邮件/Lark" if triggered else "未触发（低于阈值）",
+            "Lark 简报（聚类+洞察）": "✅ 已推送" if lark_digest_ok else "未推送（缺 LARK_WEBHOOK_URL 或发送失败）",
             "看板地址": config.DASHBOARD_URL,
             "运行时长": f"{round(time.time() - started, 1)} 秒",
         }

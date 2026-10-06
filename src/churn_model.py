@@ -444,16 +444,14 @@ def run() -> Dict[str, object]:
     (config.REPORTS_DIR / config.artefact("churn_summary.json")).write_text(
         json.dumps(summary_json, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # --- human-readable insights document ---
+    # --- human-readable insights document --------------------------------------
+    # 整篇重写。旧实现想「保留人工补充段落」，写成了 header + 新正文 + existing.split("---",1)[-1]，
+    # 而 split 在没有分隔符时返回原文本身 —— 于是每跑一次就把上一次的整篇正文再拼到文件尾部，
+    # 两次运行后正文出现两遍、相邻两段的数字互相矛盾（ARIMA 预测一份 19.27 一份 401.7）。
     text = build_insight_text(metrics_df, importance, freq_agg, summary, forecast_df, shap_row)
-    existing = ""
     insights_path = config.DOCS_DIR / "insights.md"
-    if insights_path.exists():
-        existing = insights_path.read_text(encoding="utf-8")
     header = "# 业务洞察 (Insights)\n\n> 本文件由 `src/churn_model.py` 自动生成/更新。\n\n"
-    insights_path.write_text(header + text + ("\n---\n\n" + existing.split("---", 1)[-1]
-                                              if "## 流失预测结论" in existing else ""),
-                             encoding="utf-8")
+    insights_path.write_text(header + text, encoding="utf-8")
 
     logger.info("流失预测完成：primary=%s | 预测流失率=%.1f%% | 高危占比=%.1f%%",
                 primary_name, summary["forecast_churn_rate"] * 100,

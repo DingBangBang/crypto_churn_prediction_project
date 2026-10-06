@@ -158,9 +158,31 @@ SMTP_PASS = os.getenv("SMTP_PASS", "")
 # 填上本地代理（如 Clash 混合端口 http://127.0.0.1:7897）即可让邮件走代理隧道发出。
 SMTP_PROXY = os.getenv("SMTP_PROXY", "")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "dingbangchu@gmail.com")
+
+# --- Lark (Feishu / Lark) 群机器人 ---------------------------------------------
+# 只需一个 Incoming Webhook URL 即可推送；支持国际版 open.larksuite.com 与国内版 open.feishu.cn。
 LARK_WEBHOOK_URL = os.getenv("LARK_WEBHOOK_URL", "")
-LARK_AT_PHONE = os.getenv("LARK_AT_PHONE", "13339947334")
+# 可选 @ 某人：必须是 Lark 的 open_id (ou_...) / user_id，填手机号无法 @（代码会自动忽略）。
+LARK_AT_ID = os.getenv("LARK_AT_ID", "") or os.getenv("LARK_AT_PHONE", "")
 ALERT_CHURN_RATE_THRESHOLD = _get_float("ALERT_CHURN_RATE_THRESHOLD", 0.40)
 ALERT_RISK_CLUSTER_RATIO = _get_float("ALERT_RISK_CLUSTER_RATIO", 0.25)
+
+# --- 出站网络代理（邮件 / Google API 通用）--------------------------------------
+# 国内网络对 Google 系域名（含 smtp.gmail.com、oauth2.googleapis.com）常做 TLS 层阻断，
+# 只连 TCP 通、握手会挂死。统一走本地代理即可。
+NET_PROXY = os.getenv("NET_PROXY", "") or SMTP_PROXY
+
+# --- Gmail OAuth2（Google 已下线「应用专用密码」后的正规发信方式）----------------
+# 需要 Google Cloud OAuth 客户端（类型：桌面应用）：
+#   GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET + 一次性授权拿到的 GMAIL_REFRESH_TOKEN
+GMAIL_CLIENT_ID = os.getenv("GMAIL_CLIENT_ID", "")
+GMAIL_CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET", "")
+GMAIL_REFRESH_TOKEN = os.getenv("GMAIL_REFRESH_TOKEN", "")
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+# 本地一次性授权用的回环地址（要与 OAuth 客户端里登记的重定向 URI 完全一致）
+GMAIL_REDIRECT_URI = os.getenv("GMAIL_REDIRECT_URI", "http://localhost:8765/")
 
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://localhost:8501")

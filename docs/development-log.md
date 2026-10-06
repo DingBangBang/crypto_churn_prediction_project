@@ -147,9 +147,46 @@
 - 第三方库的"友好重试"会吃掉真正的错误信息；排查这类协议问题，`set_debuglevel(1)`
   看原始交互比读异常消息快得多。
 
-配置要点：`SMTP_PASS` 必须是 16 位**应用专用密码**（不是账号登录密码）；
+配置要点（历史方案）：`SMTP_PASS` 需为 16 位**应用专用密码**（不是账号登录密码）；
 `SMTP_PROXY=http://127.0.0.1:7897`（Clash 混合端口）用于穿透出站阻断。
+> 后续 Google 逐步下线了应用专用密码，现改用 OAuth2，详见第 10 节。
 
-## 9. 待办 / 未来可优化点
+## 9. 从「只会报警」到「会讲故事」：Lark 每日简报（聚类结果 + 洞察）
+
+- 需求：机器人不能只丢一句「流失率 51.5%」，还要用**文字**讲清用户被聚成了哪几类、每类什么画像、
+  以及从模型里提炼出的 insights。
+- 做法：`collect_cluster_digest()` 直接从 SQLite 聚合（`address_clusters` ⋈ `address_features`
+  ⋈ `churn_predictions`）→ `render_cluster_text()` 把每簇渲染成「规模 / 实际流失率 / 日均笔数 /
+  持仓 / 协议数 / 闲置天数 + 一句业务解读」→ `read_insights()` 从 `docs/insights.md` 中挑出
+  SHAP 关键特征、ARIMA 预测、结论三段，并把 markdown 转成纯文本（Lark 的 `text` 消息不渲染 markdown）。
+- 决策：**Lark 简报每天例行推送、不受阈值门控**（`send_lark_digest()`），阈值只决定预警段是否标 ⚠️。
+  否则哪天指标回落，群机器人就彻底哑了，业务侧失去连续观测；邮件仍按阈值触发，避免噪音。
+- 踩坑：原实现把手机号塞进 `<at user_id="133...">` —— Lark 的 @ 只认真实 `open_id`（`ou_` 开头），
+  填手机号会导致整条消息被拒。现在只在 `ou_`/`on_`/`all` 开头时才加 @。
+
+## 10. 邮件方案变更：Google 下线「应用专用密码」→ 改用 Gmail API + OAuth2
+
+- 事实澄清：Google Cloud 的 **API Key（`AIza...`）无法用于发信**。API Key 只标识「哪个项目」，
+  而发信是以「某个用户」的身份进行，必须用 **OAuth 客户端 ID + 客户端密钥**（类型：桌面应用）
+  换来的用户授权（refresh token）。这是两套完全不同的凭证，别混用。
+- 实现：`send_email()` 变成双通道 —— 若已配置 `GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN`，
+  就走 Gmail REST API（`gmail.googleapis.com`，443 端口，顺带绕开 SMTP:465 的 TLS 阻断）；
+  否则回落到原 SMTP 路径。
+- 一次性授权：`python -m src.notify --oauth-login` 会起一个本地回环 HTTP 服务接住 Google 回调，
+  自动换取并打印 `GMAIL_REFRESH_TOKEN`，省去手动复制授权码。
+- 出站代理统一为 `NET_PROXY`（未设置时继承 `SMTP_PROXY`）；`_post_json()` 采用「代理优先、直连兜底」，
+  并在日志中标注实际走的是哪条路（本次实测 Lark 走代理推送成功：`Lark 推送已发送（经代理）`）。
+
+## 11. Bug 修复：`docs/insights.md` 每运行一次就翻倍
+
+- 现象：看板第 16 面板的洞察正文出现两遍，且两份数字互相矛盾（ARIMA 一份 19.27、一份 401.74）。
+- 根因：`churn_model.run()` 写文件时用的是
+  `header + text + existing.split("---", 1)[-1]`，本意是「保留下方人工补充段落」，但 `split`
+  在**没有分隔符**时会返回原文本身 → 上一次的整篇正文被追加到本次正文之后，每跑一次长一倍。
+- 修法：整篇重写（该文件本就声明由脚本自动生成），并在 `read_insights()` 侧做防御性去重
+  （同名标题只取第一份）。
+- 结果：`insights.md` 从 89 行（重复两遍）回到稳定 42 行，新增单测 `test_read_insights_dedupes_and_strips_noise` 守住。
+
+## 12. 待办 / 未来可优化点
 
 见 README 的「未来可优化点」章节（多链支持、图神经网络、增量特征、模型监控等）。
