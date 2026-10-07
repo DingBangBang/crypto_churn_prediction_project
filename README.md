@@ -222,7 +222,7 @@ pip install -r requirements.txt
 # 1) 配置密钥
 cp environment.env.example environment.env           # 填入 ETHERSCAN_API_KEY
 
-# 2) 按顺序执行（测试用 ADDRESS_LIMIT=200，产物带 _test 后缀；本机验证规模 2000）
+# 2) 按顺序执行（测试用 ADDRESS_LIMIT=200，TEST_MODE=False, 产物统一带_test 后缀；本机验证规模 2000）
 python src/data_fetcher.py           # 抓取 → raw_transactions
 python src/feature_engineer.py       # 特征 → address_features
 python src/cluster_analyzer.py       # 聚类 → address_clusters + 图表
