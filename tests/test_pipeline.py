@@ -101,6 +101,32 @@ def test_email_template_renders_without_leftover_placeholders():
     assert "40.0%" in html
 
 
+def test_alert_email_subject_has_no_test_prefix(monkeypatch):
+    """回归：告警邮件标题不再带 `[测试]`（与交付层 send_alerts 同款标题）。"""
+    captured: dict = {}
+
+    def _capture(subject, html_body, to=None):
+        captured["subject"] = subject
+        return True
+
+    monkeypatch.setattr(notify, "send_email", _capture)
+    monkeypatch.setattr(notify, "_send_lark_digest_payload", lambda *a, **k: True)
+    monkeypatch.setattr(notify, "notify_macos", lambda *a, **k: None)
+    digest = {"rows": [], "n_addresses": 0, "n_personas": 0, "n_noise": 0, "risk_ratio": 0.3}
+    summary = {"forecast_churn_rate": 0.55, "high_risk_ratio": 0.30, "avg_freq_drop": 5.0}
+    notify.send_alerts(summary, risk_cluster_ratio=0.30, force=True,
+                       digest=digest, status=_fake_status())
+    assert captured["subject"].startswith("⚠️")
+    assert "测试" not in captured["subject"]
+
+
+def test_gmail_selfcheck_subject_has_no_test_prefix():
+    """回归：Gmail 通道自检邮件标题也不带 `[测试]`（靠「通道自检」自说明）。"""
+    import inspect
+    src = inspect.getsource(notify)
+    assert "[测试]" not in src
+
+
 def test_frequency_vs_churn_buckets():
     df = pd.DataFrame({
         "tx_freq_daily": [0.0, 0.0, 2.0, 3.0, 0.5],

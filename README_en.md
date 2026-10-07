@@ -145,11 +145,16 @@ crypto_churn_prediction_project/
 # pull the pre-built image
 docker pull bonnie333333333/crypto-churn-prediction:latest
 
-# run the whole pipeline and start the dashboard (bind-mount ./data to persist SQLite)
+# run the whole pipeline and start the dashboard
+#   ./data    → persist SQLite
+#   ./reports → status.html + charts on the host
+#   ./docs    → insights.md (the dashboard "Business insights" panel reads it)
 docker run -d --name crypto-churn-app -p 8501:8501 \
   -e ETHERSCAN_API_KEY=YOUR_KEY \
   -e ADDRESS_LIMIT=200 \
   -v "$PWD/data:/app/data:rw" \
+  -v "$PWD/reports:/app/reports:rw" \
+  -v "$PWD/docs:/app/docs:rw" \
   bonnie333333333/crypto-churn-prediction:latest
 
 # open http://localhost:8501
@@ -206,6 +211,7 @@ point, the container runs `scripts/daily_run.py --deliver-only`, which reuses th
 | --- | --- | --- |
 | e-mail / Lark card / status page generation | **inside the container** (`run_pipeline.py --deliver`) | shares `src/deliver.py` with the local `daily_run.py`, so **identical figures** |
 | status page on disk | container writes `/app/reports/status.html` → bind-mounted to host `./reports/status.html` | double-click it on the host |
+| dashboard "Business insights" panel | reads `/app/docs/insights.md` ← bind-mounted from host `./docs` | **without `./docs` it shows "暂无洞察文本"** even after `churn_model.py` ran on the host |
 | macOS notification | **host** (end of `start.sh` / `daily_run.py`) | no GUI in the container; with `CHURN_HEADLESS=1` the delivery layer just logs a line |
 | open dashboard / open status page | **host** (`start.sh`) | `open`/`webbrowser` are no-ops inside a container |
 

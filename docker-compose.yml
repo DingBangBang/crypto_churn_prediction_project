@@ -58,6 +58,10 @@ services:
       # SQLite 数据库（宿主可读，方便备份/迁移）与生成的报告/状态页。
       - ./data:/app/data:rw
       - ./reports:/app/reports:rw
+      # **必须**挂 docs：看板第 16 面板读 `docs/insights.md`（由 churn_model.py 生成）。
+      # 不挂的话容器内 /app/docs 是空的 → 看板显示「暂无洞察文本，请先运行 churn_model.py」，
+      # 即便宿主机上已经跑完预测、insights.md 就在那儿。
+      - ./docs:/app/docs:rw
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; \
 sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health',timeout=5).status==200 else 1)"]

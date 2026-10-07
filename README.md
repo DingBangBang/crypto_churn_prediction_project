@@ -139,11 +139,16 @@ crypto_churn_prediction_project/
 # 拉取已构建好的镜像
 docker pull bonnie333333333/crypto-churn-prediction:latest
 
-# 一键跑全流程并启动看板（挂载宿主 ./data 持久化数据库）
+# 一键跑全流程并启动看板
+#   ./data    → 持久化 SQLite
+#   ./reports → status.html + 图表落到宿主
+#   ./docs    → insights.md（看板「业务洞察」面板读它）
 docker run -d --name crypto-churn-app -p 8501:8501 \
   -e ETHERSCAN_API_KEY=你的Key \
   -e ADDRESS_LIMIT=200 \
   -v "$PWD/data:/app/data:rw" \
+  -v "$PWD/reports:/app/reports:rw" \
+  -v "$PWD/docs:/app/docs:rw" \
   bonnie333333333/crypto-churn-prediction:latest
 
 # 打开 http://localhost:8501
@@ -197,6 +202,7 @@ data_fetcher → feature_engineer → cluster_analyzer → churn_model
 | --- | --- | --- |
 | 邮件 / Lark 卡片 / 状态页生成 | **容器内**（`run_pipeline.py --deliver`） | 与本机 `daily_run.py` 共用 `src/deliver.py`，**同一口径** |
 | 状态页落盘 | 容器写 `/app/reports/status.html` → 挂载到宿主机 `./reports/status.html` | 宿主机双击即可看 |
+| 看板「业务洞察」面板 | 读容器内 `/app/docs/insights.md` ← 挂载自宿主 `./docs` | **少挂 `./docs` 会显示「暂无洞察文本」**，即便宿主已跑完 `churn_model.py` |
 | macOS 通知 | **宿主机**（`start.sh` 结束后 / `daily_run.py`） | 容器无 GUI，`CHURN_HEADLESS=1` 时交付层只记一行日志 |
 | 打开看板 / 打开状态页 | **宿主机**（`start.sh`） | 容器里 `open`/`webbrowser` 无效 |
 
@@ -641,8 +647,10 @@ docker push bonnie333333333/crypto-churn-prediction:latest
 ```
 
 `docker-compose.yml` 关键点：Streamlit 端口 **8501**；`env_file` 读取
-`environment.env`（可选，未提供也能启动）；挂载 `./data` 与 `./reports` 持久化
-（**状态页 `status.html` 就靠 `./reports` 这一步带到宿主机**）；`healthcheck` 探测
+`environment.env`（可选，未提供也能启动）；挂载 `./data`、`./reports` 与 `./docs` 持久化
+（**状态页 `status.html` 靠 `./reports` 带到宿主机；看板「业务洞察」面板读的 `insights.md`
+靠 `./docs`** —— 少挂 `./docs` 时容器内 `/app/docs` 为空，面板会显示「暂无洞察文本，
+请先运行 churn_model.py」，哪怕宿主早已跑完预测）；`healthcheck` 探测
 `/_stcore/health`；`RUN_DELIVER=1` 决定首启/补发是否交付四去向；`CHURN_HEADLESS=1`
 告诉交付层「容器内没有 GUI，别弹通知也别开浏览器」。
 

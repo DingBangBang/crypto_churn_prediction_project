@@ -322,7 +322,7 @@ def enable_gmail_api_flow(manual: bool = False, write_env: bool = True) -> int:
     body = ("<p>这封邮件说明 Gmail 邮件通道已打通：OAuth2 授权 → API 启用 → 发信，"
             "整条链路 OK。</p>"
             f"<p>发送时间：{time.strftime('%Y-%m-%d %H:%M:%S')}</p>")
-    sent = send_email("[测试] ✅ Gmail API 通道自检 · 加密用户流失预警", body)
+    sent = send_email("✅ Gmail API 通道自检 · 加密用户流失预警", body)
     logger.info("自检结果：API 启用=%s ｜ 邮件发送=%s", enabled, sent)
     return 0 if sent else 1
 
@@ -1586,7 +1586,7 @@ def main(argv: List[str] | None = None) -> int:
         logger.info("预览已生成（未发送）: %s / %s", html_path, card_path)
         return 0
 
-    subject = (f"[测试] ⚠️ 加密用户流失预警 · 流失率 {context['churn_rate']}"
+    subject = (f"⚠️ 加密用户流失预警 · 流失率 {context['churn_rate']}"
                f" · 高危占比 {context['high_risk_ratio']}")
     email_ok = send_email(subject, render_email(context))
     lark_ok = False

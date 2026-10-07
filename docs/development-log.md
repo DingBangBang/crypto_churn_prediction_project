@@ -543,6 +543,29 @@
 - **教训**：受限网络下，**基础镜像先手动搞定**比反复重试 `--build` 更省时间；构建失败先看是不是
   基础镜像/site-packages 的**下载**失败，与业务代码无关。
 
+### 21.7 看板「业务洞察」面板长期空白：docker compose 漏挂 `./docs`
+
+- **现象**：流水线全量跑通（宿主 `docs/insights.md` 2591B、13:53 刚更新）、看板其余面板都有数据，
+  唯独**第 16 面板「业务洞察」显示"暂无洞察文本，请先运行 churn_model.py"**。
+- **根因**：看板进程在**容器**里，读的是 `config.DOCS_DIR/insights.md` = `/app/docs/insights.md`；
+  而 `docker-compose.yml` 的 `volumes:` 只挂了 `./data` 与 `./reports`，**没挂 `./docs`** →
+  容器内 `/app/docs` 是空的（`docker compose exec churn-app ls /app/docs` 只有 `.gitkeep`）。
+  `churn_model.py` 明明在**宿主**上写好了文件，但容器看不到 —— 又是"数据在 A、进程看 B"的老坑。
+- **修法**：`volumes:` 增加 `- ./docs:/app/docs:rw`，`docker compose up -d` 重建容器即可
+  （宿主已有 `insights.md`，**无需重跑** churn_model）。验证：`ls /app/docs/insights.md` 可见、看板刷新即出正文。
+- **附带教训（邮件标题里的"[测试]"）**：告警邮件标题的 `[测试]` 前缀出现过两处 ——
+  `notify.py` 的 `python -m src.notify` 手动推送分支与 Gmail 通道自检邮件。全量口径下这两处都不该再带"测试"
+  字样，已删除（`[测试] ⚠️ 加密用户流失预警 …` → `⚠️ 加密用户流失预警 …`；自检邮件靠正文的"通道自检"自说明）；
+  交付层 `send_alerts()` 的标题本就没有前缀，两条路径自此**标题一致**。新增单测
+  `test_alert_email_subject_has_no_test_prefix` 与 `test_gmail_selfcheck_subject_has_no_test_prefix` 守住。
+- **「跑完 churn_model.py 之后该跑什么」**：阶段顺序是 ①抓取 → ②特征 → ③聚类 → ④预测(churn_model) →
+  **⑤交付**。所以它后面只剩**交付层**：宿主 `python scripts/daily_run.py --deliver-only`（复用
+  `churn_summary.json`，不重算）—— 一封邮件 + Lark 卡片 + `reports/status.html` +（宿主机）**自动唤起
+  默认浏览器打开状态页** + macOS 通知；或整链路 `python scripts/daily_run.py` / 容器 `--deliver`。
+- **实测**：`daily_run.py --deliver-only` 日志 `Gmail API 邮件已发送` / `Lark 卡片推送已发送` /
+  `运行状态页已生成` / **`已唤起浏览器（open（默认浏览器））：file:///…/reports/status.html`** ——
+  确认「删除 [测试]」与「自动唤起状态页」两问均成立。
+
 
 
 见 README 的「未来可优化点」与「下一步优化」章节（LLM 生成建议、全量 12000 节点、
