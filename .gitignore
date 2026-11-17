@@ -36,3 +36,8 @@ reports/*.json
 
 # Generated demo artifacts
 /*.png
+
+# Runtime artifacts (DB backups + daily run logs) — kept out of the repo
+data/*.bak
+data/*.corrupt*
+logs/
